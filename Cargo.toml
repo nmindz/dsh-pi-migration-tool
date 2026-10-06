@@ -1,0 +1,29 @@
+[package]
+name = "dsh-pi-migration-tool"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Bidirectional converter between DeepSeek Harness (DSH) session logs and Oh My Pi (OMP/pi) session transcripts, with a Ratatui browser."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "dshpi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+walkdir = "2"
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
