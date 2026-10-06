@@ -1,8 +1,9 @@
-//! On-disk layout of both harnesses: session roots and the cwd-bucket encodings
+//! On-disk layout of the harnesses: session roots and the cwd-bucket encodings
 //! each one uses for its per-project session directory.
 //!
-//! DSH: `<dsh-home>/sessions/<bucket>/<session-id>/session.v<N>.jsonl.zstd`
-//! Pi:  `<omp-home>/agent/sessions/<bucket>/<timestamp>_<session-id>.jsonl`
+//! DSH:    `<dsh-home>/sessions/<bucket>/<session-id>/session.v<N>.jsonl.zstd`
+//! Pi:     `<omp-home>/agent/sessions/<bucket>/<timestamp>_<session-id>.jsonl`
+//! Claude: `<claude-config>/projects/<bucket>/<session-id>.jsonl`
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +32,38 @@ pub fn pi_root() -> PathBuf {
             None => home().join(".omp").join("agent").join("sessions"),
         },
     }
+}
+
+/// Claude Code's configuration directory. `CLAUDE_CONFIG_DIR` overrides
+/// `~/.claude`, exactly as it does for Claude Code itself.
+fn claude_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+}
+
+/// Root holding Claude Code per-project transcripts.
+pub fn claude_root() -> PathBuf {
+    match std::env::var_os("CLAUDE_SESSIONS_DIR") {
+        Some(v) => PathBuf::from(v),
+        None => claude_config_dir()
+            .unwrap_or_else(|| home().join(".claude"))
+            .join("projects"),
+    }
+}
+
+/// Claude Code's global settings file, which registers every project it opened.
+pub fn claude_settings_file() -> PathBuf {
+    match claude_config_dir() {
+        Some(dir) => dir.join(".claude.json"),
+        None => home().join(".claude.json"),
+    }
+}
+
+/// Claude Code bucket name for a working directory: every character that is
+/// not an ASCII letter or digit becomes `-`, so the encoding cannot be undone.
+pub fn encode_claude_bucket(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// DSH bucket name for a working directory: `--Users-me-Projects-x--`.
@@ -77,6 +110,14 @@ mod tests {
     fn dsh_bucket_wraps_the_absolute_path() {
         assert_eq!(encode_dsh_bucket("/Users/me/Projects/x"), "--Users-me-Projects-x--");
         assert_eq!(encode_dsh_bucket("/Users/me"), "--Users-me--");
+    }
+
+    #[test]
+    fn claude_bucket_flattens_every_non_alphanumeric_character() {
+        assert_eq!(
+            encode_claude_bucket("/Users/me.x/Projects/_drafts/a-b"),
+            "-Users-me-x-Projects--drafts-a-b"
+        );
     }
 
     #[test]

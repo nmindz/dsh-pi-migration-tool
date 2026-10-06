@@ -1,9 +1,13 @@
-//! `dshpi` — convert sessions between DeepSeek Harness and Oh My Pi.
+//! `dshpi` — convert sessions between DeepSeek Harness and Oh My Pi, and
+//! import Claude Code sessions into Oh My Pi.
 //!
 //! Running the binary with no subcommand opens the Ratatui browser; the
 //! subcommands expose the same conversions for scripts.
 
+mod claude;
+mod claude_import;
 mod convert;
+mod dedup;
 mod dsh;
 mod paths;
 mod pi;
@@ -22,6 +26,19 @@ pub enum Side {
     Dsh,
     /// Oh My Pi.
     Pi,
+    /// Claude Code; its sessions import into Pi, nothing converts into it.
+    Claude,
+}
+
+impl Side {
+    /// Harness a session of this side converts into by default.
+    pub fn counterpart(self) -> Side {
+        match self {
+            Side::Dsh => Side::Pi,
+            Side::Pi => Side::Dsh,
+            Side::Claude => Side::Pi,
+        }
+    }
 }
 
 /// Readable export formats.
@@ -37,7 +54,7 @@ pub enum ExportFormat {
 #[command(
     name = "dshpi",
     version,
-    about = "Convert sessions between DeepSeek Harness (DSH) and Oh My Pi (OMP)",
+    about = "Convert sessions between DeepSeek Harness (DSH) and Oh My Pi (OMP), and import Claude Code sessions into OMP",
     long_about = None
 )]
 struct Cli {
@@ -51,14 +68,14 @@ enum Command {
     Tui,
     /// List discovered sessions.
     List {
-        /// Which harness to list; both when omitted.
+        /// Which harness to list; every one when omitted.
         #[arg(value_enum)]
         side: Option<Side>,
         /// Keep only sessions whose title, cwd, or id contains this text.
         #[arg(short, long)]
         filter: Option<String>,
     },
-    /// Convert one session to the other harness.
+    /// Convert one session to the other harness, or import a Claude Code session into Pi.
     Convert {
         /// Session id, id prefix, or path to a session file.
         session: String,
@@ -77,6 +94,9 @@ enum Command {
         /// Also convert sessions that hold no conversation.
         #[arg(long)]
         include_empty: bool,
+        /// Import a Claude Code session even when Pi already holds a copy of it.
+        #[arg(long)]
+        include_duplicates: bool,
     },
     /// Convert every session of one harness.
     ConvertAll {
@@ -98,6 +118,9 @@ enum Command {
         /// Also convert sessions that hold no conversation.
         #[arg(long)]
         include_empty: bool,
+        /// Import Claude Code sessions even when Pi already holds a copy of them.
+        #[arg(long)]
+        include_duplicates: bool,
     },
     /// Delete migrated sessions that hold no conversation.
     PruneEmpty {
@@ -108,9 +131,10 @@ enum Command {
         #[arg(long)]
         execute: bool,
     },
-    /// Convert every session out and back, reporting any row that changed.
+    /// Convert every session out and back, reporting any row that changed;
+    /// Claude Code sessions are checked against their Pi import.
     Verify {
-        /// Which harness to check; both when omitted.
+        /// Which harness to check; every one when omitted.
         #[arg(value_enum)]
         side: Option<Side>,
         /// Keep only sessions whose title, cwd, or id contains this text.
@@ -146,14 +170,34 @@ fn main() -> Result<()> {
             dry_run,
             force,
             include_empty,
+            include_duplicates,
         } => {
             let located = locate(&session)?;
-            let to = to.unwrap_or(match located.side {
-                Side::Dsh => Side::Pi,
-                Side::Pi => Side::Dsh,
-            });
+            let to = to.unwrap_or(located.side.counterpart());
             if to == located.side {
                 bail!("source and destination are both {:?}", to);
+            }
+            if to == Side::Claude {
+                bail!("Claude Code is import-only: nothing converts into it");
+            }
+            if located.side == Side::Claude && to != Side::Pi {
+                bail!("Claude Code sessions import into Pi only");
+            }
+            if located.side == Side::Claude && !include_duplicates {
+                let index = dedup::Index::new(&pi::discover(&paths::pi_root()));
+                let found = claude::inspect_path(&located.path)
+                    .ok_or_else(|| anyhow!("{} is unreadable", located.path.display()))?;
+                let verdict = index.judge(&found.id, &found.prompts);
+                if let Some(reason) = verdict.describe() {
+                    if verdict.is_duplicate() {
+                        println!(
+                            "{} skipped: {reason}; pass --include-duplicates to import anyway",
+                            located.id
+                        );
+                        return Ok(());
+                    }
+                    eprintln!("note: {reason}");
+                }
             }
             let outcome = convert_one(&located, out.as_deref(), dry_run, force, include_empty)?;
             println!("{outcome}");
@@ -166,13 +210,17 @@ fn main() -> Result<()> {
             dry_run,
             force,
             include_empty,
+            include_duplicates,
         } => convert_all(
             from,
             filter.as_deref(),
             out.as_deref(),
-            dry_run,
-            force,
-            include_empty,
+            Flags {
+                dry_run,
+                force,
+                include_empty,
+                include_duplicates,
+            },
         ),
         Command::PruneEmpty { filter, execute } => prune_empty(filter.as_deref(), execute),
         Command::Verify { side, filter, all } => verify(side, filter.as_deref(), all),
@@ -237,6 +285,16 @@ pub fn locate(needle: &str) -> Result<Located> {
             });
         }
     }
+    for found in claude::discover(&paths::claude_root()) {
+        if found.id.to_lowercase().starts_with(&lower) {
+            return Ok(Located {
+                side: Side::Claude,
+                path: found.path,
+                id: found.id,
+                cwd: found.cwd,
+            });
+        }
+    }
     Err(anyhow!("no session matches {needle:?}"))
 }
 
@@ -249,6 +307,16 @@ fn classify(path: &Path) -> Result<Located> {
             path: path.to_path_buf(),
             id: header.id,
             cwd: header.cwd,
+        });
+    }
+    if !pi::is_session_file(path)? {
+        let found = claude::inspect_path(path)
+            .ok_or_else(|| anyhow!("{} is not a session file", path.display()))?;
+        return Ok(Located {
+            side: Side::Claude,
+            path: found.path,
+            id: found.id,
+            cwd: found.cwd,
         });
     }
     let file = pi::read_file(path)?;
@@ -281,6 +349,12 @@ pub fn destination(located: &Located, out: Option<&Path>) -> Result<PathBuf> {
                 .join(file.id())
                 .join(format!("session.v{}.jsonl.zstd", dsh::CURRENT_GENERATION)))
         }
+        Side::Claude => {
+            let root = out
+                .map(Path::to_path_buf)
+                .unwrap_or_else(paths::pi_root);
+            Ok(claude_import::Target::of(&located.path, &located.cwd)?.file(&root))
+        }
     }
 }
 
@@ -290,13 +364,16 @@ pub enum Outcome {
     Written(String),
     /// The source held no conversation and was left alone.
     Skipped(String),
+    /// Pi already holds a copy of this Claude Code session.
+    Duplicate(String),
 }
 
 impl std::fmt::Display for Outcome {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Outcome::Written(line) => write!(out, "{line}"),
-            Outcome::Skipped(line) => write!(out, "{line}"),
+            Outcome::Written(line) | Outcome::Skipped(line) | Outcome::Duplicate(line) => {
+                write!(out, "{line}")
+            }
         }
     }
 }
@@ -312,7 +389,9 @@ impl Outcome {
 ///
 /// A session that holds no conversation is skipped unless `include_empty` is
 /// set: cancelled and never-used launches leave behind logs of nothing but
-/// startup records, and importing them buries the real sessions.
+/// startup records, and importing them buries the real sessions. A Claude
+/// Code session needs a model reply to count: one that ran only slash
+/// commands, or whose prompts nothing answered, holds no conversation.
 pub fn convert_one(
     located: &Located,
     out: Option<&Path>,
@@ -366,6 +445,38 @@ pub fn convert_one(
                 report.rows,
                 report.mapped,
                 report.passthrough
+            )))
+        }
+        Side::Claude => {
+            let import = claude_import::import(&located.path, &located.cwd)?;
+            if !include_empty && !import.main.has_reply() {
+                return Ok(Outcome::Skipped(format!(
+                    "{} skipped: no conversation",
+                    located.id
+                )));
+            }
+            guard_destination(&target, force, dry_run)?;
+            let subagents: Vec<&(String, pi::SessionFile)> = import
+                .subagents
+                .iter()
+                .filter(|(_, file)| include_empty || file.has_reply())
+                .collect();
+            if !dry_run {
+                pi::write_file(&target, &import.main)?;
+                let dir = claude_import::subagent_dir(&target);
+                for (name, file) in &subagents {
+                    pi::write_file(&dir.join(name), file)?;
+                }
+            }
+            let report = &import.report;
+            Ok(Outcome::Written(format!(
+                "{prefix}{} -> {} ({} entries in {} file(s): {} records carried, {} bookkeeping records left out)",
+                located.id,
+                target.display(),
+                report.entries,
+                1 + subagents.len(),
+                report.mapped,
+                report.skipped
             )))
         }
     }
@@ -431,7 +542,7 @@ fn prune_empty(filter: Option<&str>, execute: bool) -> Result<()> {
     Ok(())
 }
 
-/// Lists sessions on one or both sides.
+/// Lists sessions of one harness, or of every harness.
 fn list(side: Option<Side>, filter: Option<&str>) -> Result<()> {
     let needle = filter.map(str::to_lowercase);
     let matches = |haystack: &[&str]| match &needle {
@@ -440,8 +551,9 @@ fn list(side: Option<Side>, filter: Option<&str>) -> Result<()> {
             .iter()
             .any(|field| field.to_lowercase().contains(needle)),
     };
+    let show = |which: Side| side.is_none() || side == Some(which);
 
-    if side != Some(Side::Pi) {
+    if show(Side::Dsh) {
         println!("# DSH  ({})", paths::dsh_root().display());
         for found in dsh::discover(&paths::dsh_root()) {
             let title = found.title.clone().unwrap_or_default();
@@ -459,9 +571,14 @@ fn list(side: Option<Side>, filter: Option<&str>) -> Result<()> {
             );
         }
     }
-    if side != Some(Side::Dsh) {
+    let pi_sessions = if show(Side::Pi) || show(Side::Claude) {
+        pi::discover(&paths::pi_root())
+    } else {
+        Vec::new()
+    };
+    if show(Side::Pi) {
         println!("# Pi   ({})", paths::pi_root().display());
-        for found in pi::discover(&paths::pi_root()) {
+        for found in &pi_sessions {
             if !matches(&[&found.id, &found.cwd, &found.title]) {
                 continue;
             }
@@ -475,57 +592,122 @@ fn list(side: Option<Side>, filter: Option<&str>) -> Result<()> {
             );
         }
     }
+    if show(Side::Claude) {
+        println!("# Claude  ({})", paths::claude_root().display());
+        let index = dedup::Index::new(&pi_sessions);
+        for found in claude::discover(&paths::claude_root()) {
+            if !matches(&[&found.id, &found.cwd, found.label()]) {
+                continue;
+            }
+            let verdict = index.judge(&found.id, &found.prompts);
+            let mark = match &verdict {
+                dedup::Verdict::Fresh => "",
+                dedup::Verdict::Overlap { .. } => "~",
+                _ => "dup",
+            };
+            println!(
+                "{:<38} {:<10} {:>5} msg {:<3}  {:<28} {}{}",
+                found.id,
+                &convert::iso(found.started)[..10],
+                found.messages,
+                mark,
+                shorten(&found.cwd, 28),
+                clip(found.label(), 60),
+                verdict
+                    .describe()
+                    .map(|reason| format!("  ← {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
     Ok(())
 }
 
-/// Converts every session of one harness.
-fn convert_all(
-    from: Side,
-    filter: Option<&str>,
-    out: Option<&Path>,
+/// Switches shared by the conversion commands.
+struct Flags {
     dry_run: bool,
     force: bool,
     include_empty: bool,
-) -> Result<()> {
+    include_duplicates: bool,
+}
+
+/// Converts every session of one harness; Claude Code sessions Pi already
+/// holds are left out unless `include_duplicates` is set.
+fn convert_all(from: Side, filter: Option<&str>, out: Option<&Path>, flags: Flags) -> Result<()> {
     let needle = filter.map(str::to_lowercase);
     let keep = |fields: &[&str]| match &needle {
         None => true,
         Some(needle) => fields.iter().any(|f| f.to_lowercase().contains(needle)),
     };
 
-    let targets: Vec<Located> = match from {
+    // Each target carries the reason it duplicates a Pi session, if it does.
+    let targets: Vec<(Located, Option<String>)> = match from {
         Side::Dsh => dsh::discover(&paths::dsh_root())
             .into_iter()
             .filter(|found| {
                 let title = found.title.clone().unwrap_or_default();
                 keep(&[&found.id, &found.cwd, &title])
             })
-            .map(|found| Located {
-                side: Side::Dsh,
-                path: found.path,
-                id: found.id,
-                cwd: found.cwd,
+            .map(|found| {
+                let located = Located {
+                    side: Side::Dsh,
+                    path: found.path,
+                    id: found.id,
+                    cwd: found.cwd,
+                };
+                (located, None)
             })
             .collect(),
         Side::Pi => pi::discover(&paths::pi_root())
             .into_iter()
             .filter(|found| keep(&[&found.id, &found.cwd, &found.title]))
-            .map(|found| Located {
-                side: Side::Pi,
-                path: found.path,
-                id: found.id,
-                cwd: found.cwd,
+            .map(|found| {
+                let located = Located {
+                    side: Side::Pi,
+                    path: found.path,
+                    id: found.id,
+                    cwd: found.cwd,
+                };
+                (located, None)
             })
             .collect(),
+        Side::Claude => {
+            let index = dedup::Index::new(&pi::discover(&paths::pi_root()));
+            claude::discover(&paths::claude_root())
+                .into_iter()
+                .filter(|found| keep(&[&found.id, &found.cwd, found.label()]))
+                .map(|found| {
+                    let verdict = index.judge(&found.id, &found.prompts);
+                    let duplicate = verdict.is_duplicate().then(|| verdict.describe()).flatten();
+                    let located = Located {
+                        side: Side::Claude,
+                        path: found.path,
+                        id: found.id,
+                        cwd: found.cwd,
+                    };
+                    (located, duplicate)
+                })
+                .collect()
+        }
     };
 
+    let mut converted = 0usize;
+    let mut empty = 0usize;
+    let mut duplicates = 0usize;
     let mut failures = 0usize;
-    let mut skipped = 0usize;
-    for located in &targets {
-        match convert_one(located, out, dry_run, force, include_empty) {
+    for (located, duplicate) in &targets {
+        let result = match duplicate {
+            Some(reason) if !flags.include_duplicates => {
+                Ok(Outcome::Duplicate(format!("{} skipped: {reason}", located.id)))
+            }
+            _ => convert_one(located, out, flags.dry_run, flags.force, flags.include_empty),
+        };
+        match result {
             Ok(outcome) => {
-                if !outcome.wrote() {
-                    skipped += 1;
+                match outcome {
+                    Outcome::Written(_) => converted += 1,
+                    Outcome::Skipped(_) => empty += 1,
+                    Outcome::Duplicate(_) => duplicates += 1,
                 }
                 println!("{outcome}");
             }
@@ -536,9 +718,8 @@ fn convert_all(
         }
     }
     println!(
-        "{} session(s), {} converted, {skipped} empty, {failures} failed",
-        targets.len(),
-        targets.len() - skipped - failures
+        "{} session(s), {converted} converted, {empty} empty, {duplicates} already in Pi, {failures} failed",
+        targets.len()
     );
     if failures > 0 {
         bail!("{failures} conversion(s) failed");
@@ -550,6 +731,8 @@ fn convert_all(
 ///
 /// A DSH session is converted to Pi and back; a Pi session is converted to DSH
 /// and back. Both directions must reproduce every source row byte for byte.
+/// A Claude Code session is imported and every transcript block of the source
+/// must reappear in the Pi copy.
 fn verify(side: Option<Side>, filter: Option<&str>, show_all: bool) -> Result<()> {
     let needle = filter.map(str::to_lowercase);
     let keep = |fields: &[&str]| match &needle {
@@ -562,7 +745,7 @@ fn verify(side: Option<Side>, filter: Option<&str>, show_all: bool) -> Result<()
     let mut damaged = 0usize;
     let mut unreadable = 0usize;
 
-    if side != Some(Side::Pi) {
+    if side.is_none() || side == Some(Side::Dsh) {
         for found in dsh::discover(&paths::dsh_root()) {
             let title = found.title.clone().unwrap_or_default();
             if !keep(&[&found.id, &found.cwd, &title]) {
@@ -592,7 +775,7 @@ fn verify(side: Option<Side>, filter: Option<&str>, show_all: bool) -> Result<()
         }
     }
 
-    if side != Some(Side::Dsh) {
+    if side.is_none() || side == Some(Side::Pi) {
         for found in pi::discover(&paths::pi_root()) {
             if !keep(&[&found.id, &found.cwd, &found.title]) {
                 continue;
@@ -621,11 +804,106 @@ fn verify(side: Option<Side>, filter: Option<&str>, show_all: bool) -> Result<()
         }
     }
 
+    if side.is_none() || side == Some(Side::Claude) {
+        for found in claude::discover(&paths::claude_root()) {
+            if !keep(&[&found.id, &found.cwd, found.label()]) {
+                continue;
+            }
+            checked += 1;
+            let differences = match verify_claude(&found) {
+                Ok(differences) => differences,
+                Err(error) => {
+                    unreadable += 1;
+                    eprintln!("{} unreadable: {error:#}", found.id);
+                    continue;
+                }
+            };
+            if differences.is_empty() {
+                perfect += 1;
+            } else {
+                damaged += 1;
+                println!("{}: {} difference(s)", found.id, differences.len());
+                for line in differences.iter().take(if show_all { usize::MAX } else { 3 }) {
+                    println!("    {line}");
+                }
+            }
+        }
+    }
+
     println!("{checked} checked · {perfect} identical · {damaged} changed · {unreadable} unreadable");
     if damaged > 0 || unreadable > 0 {
         bail!("{damaged} session(s) did not round-trip, {unreadable} unreadable");
     }
     Ok(())
+}
+
+/// Imports one Claude Code session and compares its transcript, and every
+/// subagent's, against the Pi copies.
+fn verify_claude(found: &claude::SessionRef) -> Result<Vec<String>> {
+    let import = claude_import::import(&found.path, &found.cwd)?;
+    let records = claude::read_records(&found.path)?;
+    let mut out = diff_lanes(
+        &transcript::from_claude(&records, false),
+        &transcript::from_pi(&import.main),
+    );
+    let sources = claude::subagent_files(&found.path);
+    for (name, file) in &import.subagents {
+        let Some(source) = sources
+            .iter()
+            .find(|path| path.file_name().is_some_and(|n| n.to_string_lossy() == name.as_str()))
+        else {
+            out.push(format!("{name}: no source transcript"));
+            continue;
+        };
+        let records = claude::read_records(source)?;
+        for line in diff_lanes(&transcript::from_claude(&records, true), &transcript::from_pi(file)) {
+            out.push(format!("{name}: {line}"));
+        }
+    }
+    Ok(out)
+}
+
+/// Compares two transcripts lane by lane: prompts, replies, reasoning, tool
+/// calls, tool results, injected context, and compactions each keep their own
+/// order. Interleaving across lanes may differ, because Pi puts a response's
+/// tool results right after it while Claude Code records them as they arrive.
+fn diff_lanes(before: &[transcript::Block], after: &[transcript::Block]) -> Vec<String> {
+    use transcript::Speaker;
+    fn lanes(blocks: &[transcript::Block]) -> std::collections::BTreeMap<&'static str, Vec<&transcript::Block>> {
+        let mut out: std::collections::BTreeMap<&'static str, Vec<&transcript::Block>> = Default::default();
+        for block in blocks {
+            let lane = match block.speaker {
+                Speaker::User => "prompt",
+                Speaker::Assistant => "reply",
+                Speaker::Thinking => "reasoning",
+                Speaker::ToolCall => "tool call",
+                Speaker::ToolResult => "tool result",
+                Speaker::System => "context",
+                Speaker::Meta if block.heading == "compaction" => "compaction",
+                Speaker::Meta => continue,
+            };
+            out.entry(lane).or_default().push(block);
+        }
+        out
+    }
+    let (left, right) = (lanes(before), lanes(after));
+    let mut out = Vec::new();
+    let names: std::collections::BTreeSet<&&str> = left.keys().chain(right.keys()).collect();
+    for name in names {
+        let empty = Vec::new();
+        let a = left.get(*name).unwrap_or(&empty);
+        let b = right.get(*name).unwrap_or(&empty);
+        if a.len() != b.len() {
+            out.push(format!("{name}: {} -> {} blocks", a.len(), b.len()));
+        }
+        for (index, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            if x.heading != y.heading || x.body != y.body {
+                out.push(format!("{name} {index} differs"));
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Describes every DSH row that differs between an original and a round trip.
@@ -691,6 +969,12 @@ fn export(session: &str, format: ExportFormat, out: Option<&Path>) -> Result<()>
             let file = pi::read_file(&located.path)?;
             (file.title.clone(), transcript::from_pi(&file))
         }
+        Side::Claude => {
+            let found = claude::inspect_path(&located.path)
+                .ok_or_else(|| anyhow!("{} is unreadable", located.path.display()))?;
+            let records = claude::read_records(&located.path)?;
+            (found.label().to_string(), transcript::from_claude(&records, false))
+        }
     };
     let rendered = match format {
         ExportFormat::Md => transcript::to_markdown(&title, &located.cwd, &blocks),
@@ -727,4 +1011,15 @@ pub fn shorten(text: &str, width: usize) -> String {
     }
     let tail: String = chars[chars.len() - (width - 1)..].iter().collect();
     format!("…{tail}")
+}
+
+/// Cuts text to `width` characters, marking the cut at the end; titles read
+/// from the start, so unlike [`shorten`] this keeps the head.
+pub fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }

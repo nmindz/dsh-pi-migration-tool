@@ -1,8 +1,12 @@
-//! Readable projection of either format: the browser's preview pane and the
+//! Readable projection of every format: the browser's preview pane and the
 //! Markdown export share this one rendering.
 
-use serde_json::Value;
+use std::collections::HashMap;
 
+use serde_json::{json, Value};
+
+use crate::claude;
+use crate::claude_import::META_TYPE;
 use crate::convert::iso;
 use crate::dsh;
 use crate::pi;
@@ -347,6 +351,120 @@ pub fn from_dsh(log: &dsh::Log) -> Vec<Block> {
     out
 }
 
+/// True when a Claude content value holds anything to show: a non-empty
+/// string, or at least one typed block.
+fn has_content(content: &Value) -> bool {
+    match content {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => items
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str).is_some()),
+        _ => false,
+    }
+}
+
+/// Builds a readable transcript from Claude Code records, in file order.
+///
+/// `subagent` keeps the sidechain records a subagent transcript consists of;
+/// in a session transcript they belong to subagents and are left out.
+pub fn from_claude(records: &[Value], subagent: bool) -> Vec<Block> {
+    let uuids = claude::record_uuids(records);
+    let mut tool_names: HashMap<&str, &str> = HashMap::new();
+    let mut out = Vec::new();
+    let mut time = String::new();
+    for record in records {
+        if let Some(stamp) = record.get("timestamp").and_then(Value::as_str) {
+            time = stamp.to_string();
+        }
+        let kind = record.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(kind, "user" | "assistant") && !subagent && claude::is_sidechain(record) {
+            continue;
+        }
+        let content = record
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .unwrap_or(&Value::Null);
+        let flag = |name: &str| record.get(name).and_then(Value::as_bool) == Some(true);
+        let mut push = |speaker: Speaker, heading: &str, body: String| {
+            out.push(Block {
+                speaker,
+                heading: heading.to_string(),
+                body,
+                time: time.clone(),
+            })
+        };
+        match kind {
+            "user" if flag("isCompactSummary") => push(Speaker::Meta, "compaction", flatten(content)),
+            "user" if flag("isMeta") => {
+                if has_content(content) {
+                    push(Speaker::System, META_TYPE, flatten(content));
+                }
+            }
+            "user" => match content {
+                Value::Array(items) => {
+                    let is_result =
+                        |b: &Value| b.get("type").and_then(Value::as_str) == Some("tool_result");
+                    for block in items.iter().filter(|b| is_result(b)) {
+                        let call = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                        push(
+                            Speaker::ToolResult,
+                            tool_names.get(call).copied().unwrap_or("unknown"),
+                            flatten(block.get("content").unwrap_or(&Value::Null)),
+                        );
+                    }
+                    for run in items.split(|b| is_result(b)) {
+                        if has_content(&json!(run)) {
+                            push(Speaker::User, "", flatten(&json!(run)));
+                        }
+                    }
+                }
+                other if has_content(other) => push(Speaker::User, "", flatten(other)),
+                _ => {}
+            },
+            "assistant" => {
+                let message = record.get("message").unwrap_or(&Value::Null);
+                let model = message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or("unknown");
+                for block in content.as_array().into_iter().flatten() {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("thinking") => push(
+                            Speaker::Thinking,
+                            "",
+                            block.get("thinking").and_then(Value::as_str).unwrap_or("").to_string(),
+                        ),
+                        Some("text") => push(
+                            Speaker::Assistant,
+                            model,
+                            block.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+                        ),
+                        Some("tool_use") => {
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                                tool_names.insert(id, name);
+                            }
+                            let empty = json!({});
+                            let input = block.get("input").filter(|i| i.is_object()).unwrap_or(&empty);
+                            let (heading, body) = render_call(name, input);
+                            push(Speaker::ToolCall, &heading, body);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "attachment" => {
+                if let Some(prompt) = claude::queued_prompt(record, &uuids) {
+                    push(Speaker::User, "", flatten(prompt));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Renders a transcript as Markdown.
 pub fn to_markdown(title: &str, cwd: &str, blocks: &[Block]) -> String {
     let mut out = String::new();
@@ -400,6 +518,7 @@ mod tests {
     fn pi_assistant_blocks_split_by_speaker() {
         let file = pi::SessionFile {
             title: "t".into(),
+            title_source: None,
             title_updated_at: String::new(),
             header: pi::make_header("x", "2026-01-01T00:00:00.000Z", "/w", &[]),
             entries: vec![json!({

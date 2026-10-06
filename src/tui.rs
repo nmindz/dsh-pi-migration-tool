@@ -1,7 +1,11 @@
-//! Ratatui browser: list both harnesses side by side, preview a transcript, and
+//! Ratatui browser: list every harness's sessions, preview a transcript, and
 //! convert the selected sessions.
+//!
+//! The Claude Code tab groups sessions by project. Projects and sessions both
+//! carry checkboxes, sessions Pi already holds are marked and start unchecked,
+//! and importing asks for confirmation since the checked set starts populated.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -16,7 +20,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::transcript::{self, Speaker};
-use crate::{convert_one, dsh, paths, pi, shorten, Located, Side};
+use crate::{claude, clip, convert_one, dedup, dsh, paths, pi, shorten, Located, Side};
 
 const ACCENT: Color = Color::Rgb(0x5f, 0xd7, 0xff);
 const DIM: Color = Color::Rgb(0x80, 0x80, 0x80);
@@ -24,22 +28,82 @@ const OK: Color = Color::Rgb(0x87, 0xd7, 0x87);
 const WARN: Color = Color::Rgb(0xff, 0xaf, 0x5f);
 const BAD: Color = Color::Rgb(0xff, 0x5f, 0x5f);
 
+/// Tab order; `tab` walks it forward and `shift-tab` backward.
+const SIDES: [Side; 3] = [Side::Dsh, Side::Pi, Side::Claude];
+
 /// One session as the browser displays it.
 struct Row {
     id: String,
+    /// Display name. For an unnamed Claude Code session this is its first
+    /// prompt, or its id when it has none.
     title: String,
+    /// False when `title` stands in for a missing name.
+    named: bool,
     cwd: String,
     when: String,
     detail: String,
     messages: usize,
+    /// True when the session holds no conversation: no message at all, or
+    /// for Claude Code no model reply.
+    empty: bool,
     bucket: String,
     size: u64,
     path: PathBuf,
     side: Side,
+    /// How a Claude Code session relates to what Pi already holds.
+    verdict: Option<dedup::Verdict>,
+}
+
+impl Row {
+    /// True when Pi already holds a copy of this Claude Code session.
+    fn duplicate(&self) -> bool {
+        self.verdict.as_ref().is_some_and(dedup::Verdict::is_duplicate)
+    }
+
+    fn located(&self) -> Located {
+        Located {
+            side: self.side,
+            path: self.path.clone(),
+            id: self.id.clone(),
+            cwd: self.cwd.clone(),
+        }
+    }
+}
+
+/// One Claude Code project: a working directory and its sessions, newest first.
+struct Project {
+    cwd: String,
+    rows: Vec<usize>,
+}
+
+/// One line of the session list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    /// A Claude Code project heading.
+    Project(usize),
+    /// A session, by index into the current side's rows.
+    Row(usize),
+}
+
+/// How many of a project's shown sessions are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    None,
+    Some,
+    All,
+}
+
+impl Check {
+    fn glyph(self) -> &'static str {
+        match self {
+            Check::None => "[ ]",
+            Check::Some => "[-]",
+            Check::All => "[x]",
+        }
+    }
 }
 
 /// Which full-screen panel is covering the browser.
-#[derive(PartialEq, Eq)]
 enum Overlay {
     /// The browser itself.
     None,
@@ -47,6 +111,8 @@ enum Overlay {
     Preview,
     /// The key map.
     Help,
+    /// Asks before importing these Claude Code sessions.
+    Confirm(Vec<PathBuf>),
 }
 
 /// Browser state.
@@ -54,10 +120,20 @@ struct App {
     side: Side,
     dsh_rows: Vec<Row>,
     pi_rows: Vec<Row>,
-    view: Vec<usize>,
+    claude_rows: Vec<Row>,
+    projects: Vec<Project>,
+    /// Project of each Claude row.
+    project_of: Vec<usize>,
+    /// Working directories of the folded projects.
+    collapsed: HashSet<String>,
+    view: Vec<Item>,
     cursor: usize,
     selected_dsh: HashSet<PathBuf>,
     selected_pi: HashSet<PathBuf>,
+    selected_claude: HashSet<PathBuf>,
+    /// Claude transcripts already given their default check, so a rescan only
+    /// pre-checks sessions that appeared since.
+    seen_claude: HashSet<PathBuf>,
     filter: String,
     editing_filter: bool,
     overlay: Overlay,
@@ -78,10 +154,16 @@ impl App {
             side: Side::Dsh,
             dsh_rows: Vec::new(),
             pi_rows: Vec::new(),
+            claude_rows: Vec::new(),
+            projects: Vec::new(),
+            project_of: Vec::new(),
+            collapsed: HashSet::new(),
             view: Vec::new(),
             cursor: 0,
             selected_dsh: HashSet::new(),
             selected_pi: HashSet::new(),
+            selected_claude: HashSet::new(),
+            seen_claude: HashSet::new(),
             filter: String::new(),
             editing_filter: false,
             overlay: Overlay::None,
@@ -99,13 +181,14 @@ impl App {
         app
     }
 
-    /// Re-reads both session roots.
+    /// Re-reads every session root and re-judges Claude Code sessions against Pi.
     fn refresh(&mut self) {
         self.dsh_rows = dsh::discover(&paths::dsh_root())
             .into_iter()
             .map(|found| Row {
                 id: found.id,
                 title: found.title.unwrap_or_default(),
+                named: true,
                 cwd: found.cwd,
                 when: crate::convert::iso(found.created_at),
                 detail: format!(
@@ -119,27 +202,83 @@ impl App {
                     found.events
                 ),
                 messages: found.messages,
+                empty: found.messages == 0,
                 bucket: found.bucket,
                 size: found.size,
                 path: found.path,
                 side: Side::Dsh,
+                verdict: None,
             })
             .collect();
-        self.pi_rows = pi::discover(&paths::pi_root())
+
+        let pi_found = pi::discover(&paths::pi_root());
+        let index = dedup::Index::new(&pi_found);
+        self.pi_rows = pi_found
             .into_iter()
             .map(|found| Row {
                 id: found.id,
                 title: found.title,
+                named: true,
                 cwd: found.cwd,
                 when: found.timestamp,
                 detail: format!("{} entries", found.entries),
                 messages: found.messages,
+                empty: found.messages == 0,
                 bucket: found.bucket,
                 size: found.size,
                 path: found.path,
                 side: Side::Pi,
+                verdict: None,
             })
             .collect();
+
+        self.claude_rows = claude::discover(&paths::claude_root())
+            .into_iter()
+            .map(|found| {
+                let verdict = index.judge(&found.id, &found.prompts);
+                Row {
+                    title: found.label().to_string(),
+                    named: found.name.is_some(),
+                    id: found.id,
+                    cwd: found.cwd,
+                    when: crate::convert::iso(found.started),
+                    detail: format!("{} subagent(s)", found.subagents),
+                    messages: found.messages,
+                    empty: found.replies == 0,
+                    bucket: found.bucket,
+                    size: found.size,
+                    path: found.path,
+                    side: Side::Claude,
+                    verdict: Some(verdict),
+                }
+            })
+            .collect();
+
+        // Rows arrive newest first, so projects order by their newest session.
+        let mut slots: HashMap<&str, usize> = HashMap::new();
+        let mut projects: Vec<Project> = Vec::new();
+        let mut project_of = Vec::with_capacity(self.claude_rows.len());
+        for (index, row) in self.claude_rows.iter().enumerate() {
+            let slot = *slots.entry(row.cwd.as_str()).or_insert_with(|| {
+                projects.push(Project {
+                    cwd: row.cwd.clone(),
+                    rows: Vec::new(),
+                });
+                projects.len() - 1
+            });
+            projects[slot].rows.push(index);
+            project_of.push(slot);
+        }
+        self.projects = projects;
+        self.project_of = project_of;
+
+        let present: HashSet<&PathBuf> = self.claude_rows.iter().map(|row| &row.path).collect();
+        self.selected_claude.retain(|path| present.contains(path));
+        for row in &self.claude_rows {
+            if self.seen_claude.insert(row.path.clone()) && !row.empty && !row.duplicate() {
+                self.selected_claude.insert(row.path.clone());
+            }
+        }
         self.reindex();
     }
 
@@ -148,6 +287,7 @@ impl App {
         match self.side {
             Side::Dsh => &self.dsh_rows,
             Side::Pi => &self.pi_rows,
+            Side::Claude => &self.claude_rows,
         }
     }
 
@@ -156,6 +296,7 @@ impl App {
         match self.side {
             Side::Dsh => &mut self.selected_dsh,
             Side::Pi => &mut self.selected_pi,
+            Side::Claude => &mut self.selected_claude,
         }
     }
 
@@ -164,33 +305,115 @@ impl App {
         match self.side {
             Side::Dsh => self.selected_dsh.contains(path),
             Side::Pi => self.selected_pi.contains(path),
+            Side::Claude => self.selected_claude.contains(path),
         }
     }
 
-    /// Recomputes the filtered view and clamps the cursor.
-    fn reindex(&mut self) {
+    /// True when a row passes the empty-session rule and the filter.
+    fn visible(&self, row: &Row) -> bool {
+        if !self.include_empty && row.empty {
+            return false;
+        }
         let needle = self.filter.to_lowercase();
-        self.view = self
-            .rows()
+        needle.is_empty()
+            || [&row.id, &row.title, &row.cwd]
+                .iter()
+                .any(|field| field.to_lowercase().contains(&needle))
+    }
+
+    /// A project's sessions that pass [`App::visible`], whether or not it is folded.
+    fn project_rows(&self, project: usize) -> Vec<usize> {
+        self.projects[project]
+            .rows
             .iter()
-            .enumerate()
-            .filter(|(_, row)| self.include_empty || row.messages > 0)
-            .filter(|(_, row)| {
-                needle.is_empty()
-                    || row.id.to_lowercase().contains(&needle)
-                    || row.title.to_lowercase().contains(&needle)
-                    || row.cwd.to_lowercase().contains(&needle)
-            })
-            .map(|(index, _)| index)
-            .collect();
+            .copied()
+            .filter(|index| self.visible(&self.claude_rows[*index]))
+            .collect()
+    }
+
+    /// True when a project shows its sessions. A filter unfolds every project
+    /// so matches are never hidden.
+    fn expanded(&self, project: usize) -> bool {
+        !self.filter.is_empty() || !self.collapsed.contains(&self.projects[project].cwd)
+    }
+
+    /// How many of a project's shown sessions are checked.
+    fn check_state(&self, project: usize) -> Check {
+        let rows = self.project_rows(project);
+        let checked = rows
+            .iter()
+            .filter(|index| self.selected_claude.contains(&self.claude_rows[**index].path))
+            .count();
+        match checked {
+            0 => Check::None,
+            n if n == rows.len() => Check::All,
+            _ => Check::Some,
+        }
+    }
+
+    /// Recomputes the list and clamps the cursor.
+    fn reindex(&mut self) {
+        self.view = match self.side {
+            Side::Claude => {
+                let mut view = Vec::new();
+                for project in 0..self.projects.len() {
+                    let rows = self.project_rows(project);
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    view.push(Item::Project(project));
+                    if self.expanded(project) {
+                        view.extend(rows.into_iter().map(Item::Row));
+                    }
+                }
+                view
+            }
+            _ => self
+                .rows()
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| self.visible(row))
+                .map(|(index, _)| Item::Row(index))
+                .collect(),
+        };
         if self.cursor >= self.view.len() {
             self.cursor = self.view.len().saturating_sub(1);
         }
     }
 
-    /// Row under the cursor.
+    /// Switches tabs and starts at the top of the new list.
+    fn switch(&mut self, side: Side) {
+        self.side = side;
+        self.cursor = 0;
+        self.reindex();
+    }
+
+    /// Steps through the tabs, forward or backward.
+    fn cycle(&mut self, forward: bool) {
+        let at = SIDES.iter().position(|s| *s == self.side).unwrap_or(0);
+        let next = if forward {
+            (at + 1) % SIDES.len()
+        } else {
+            (at + SIDES.len() - 1) % SIDES.len()
+        };
+        self.switch(SIDES[next]);
+    }
+
+    /// Row under the cursor, when the cursor is on a session.
     fn current(&self) -> Option<&Row> {
-        self.view.get(self.cursor).map(|index| &self.rows()[*index])
+        match self.view.get(self.cursor)? {
+            Item::Row(index) => self.rows().get(*index),
+            Item::Project(_) => None,
+        }
+    }
+
+    /// Project under the cursor, or the project of the session under it.
+    fn current_project(&self) -> Option<usize> {
+        match self.view.get(self.cursor)? {
+            Item::Project(project) => Some(*project),
+            Item::Row(index) if self.side == Side::Claude => self.project_of.get(*index).copied(),
+            Item::Row(_) => None,
+        }
     }
 
     /// Appends one line to the activity log.
@@ -198,6 +421,71 @@ impl App {
         self.log.push((text.into(), color));
         if self.log.len() > 200 {
             self.log.remove(0);
+        }
+    }
+
+    /// Toggles the session under the cursor, or every shown session of the
+    /// project under it: all become checked unless all already were.
+    fn toggle(&mut self) {
+        match self.view.get(self.cursor).copied() {
+            Some(Item::Row(index)) => {
+                let path = self.rows()[index].path.clone();
+                let selection = self.selection();
+                if !selection.insert(path.clone()) {
+                    selection.remove(&path);
+                }
+            }
+            Some(Item::Project(project)) => {
+                let check = self.check_state(project) != Check::All;
+                for index in self.project_rows(project) {
+                    let path = self.claude_rows[index].path.clone();
+                    if check {
+                        self.selected_claude.insert(path);
+                    } else {
+                        self.selected_claude.remove(&path);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Every shown session of the current side, folded projects included.
+    fn shown_paths(&self) -> Vec<PathBuf> {
+        match self.side {
+            Side::Claude => (0..self.projects.len())
+                .flat_map(|project| self.project_rows(project))
+                .map(|index| self.claude_rows[index].path.clone())
+                .collect(),
+            _ => self
+                .view
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Row(index) => Some(self.rows()[*index].path.clone()),
+                    Item::Project(_) => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Folds or unfolds the project under the cursor; `None` flips it.
+    fn fold(&mut self, collapse: Option<bool>) {
+        let Some(project) = self.current_project() else {
+            return;
+        };
+        let cwd = self.projects[project].cwd.clone();
+        let collapse = collapse.unwrap_or(!self.collapsed.contains(&cwd));
+        if collapse {
+            self.collapsed.insert(cwd);
+        } else {
+            self.collapsed.remove(&cwd);
+        }
+        self.reindex();
+        if let Some(at) = self.view.iter().position(|item| *item == Item::Project(project)) {
+            self.cursor = at;
+        }
+        if !self.filter.is_empty() {
+            self.say("projects stay unfolded while a filter is active", DIM);
         }
     }
 
@@ -210,6 +498,8 @@ impl App {
         let loaded = match side {
             Side::Dsh => dsh::read_log(&path).map(|log| (transcript::from_dsh(&log), log.histogram())),
             Side::Pi => pi::read_file(&path).map(|file| (transcript::from_pi(&file), file.histogram())),
+            Side::Claude => claude::read_records(&path)
+                .map(|records| (transcript::from_claude(&records, false), claude::histogram(&records))),
         };
         match loaded {
             Ok((blocks, histogram)) => {
@@ -223,46 +513,65 @@ impl App {
         }
     }
 
-    /// Converts the selected rows, or the cursor row when nothing is selected.
-    fn convert_selection(&mut self) {
-        let side = self.side;
-        let selected: Vec<PathBuf> = match side {
-            Side::Dsh => self.selected_dsh.iter().cloned().collect(),
-            Side::Pi => self.selected_pi.iter().cloned().collect(),
-        };
-        let mut targets: Vec<(PathBuf, String, String)> = Vec::new();
-        if selected.is_empty() {
-            if let Some(row) = self.current() {
-                targets.push((row.path.clone(), row.id.clone(), row.cwd.clone()));
-            }
-        } else {
-            for path in selected {
-                if let Some(row) = self.rows().iter().find(|row| row.path == path) {
-                    targets.push((row.path.clone(), row.id.clone(), row.cwd.clone()));
-                }
-            }
+    /// What `x` acts on: the checked sessions, else the session under the
+    /// cursor, else the shown sessions of the project under it.
+    fn targets(&self) -> Vec<PathBuf> {
+        let selected: Vec<PathBuf> = self
+            .rows()
+            .iter()
+            .filter(|row| self.is_selected(&row.path))
+            .map(|row| row.path.clone())
+            .collect();
+        if !selected.is_empty() {
+            return selected;
         }
+        match self.view.get(self.cursor) {
+            Some(Item::Row(index)) => vec![self.rows()[*index].path.clone()],
+            Some(Item::Project(project)) => self
+                .project_rows(*project)
+                .into_iter()
+                .map(|index| self.claude_rows[index].path.clone())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Converts right away, except that Claude Code imports ask first.
+    fn request_convert(&mut self) {
+        let targets = self.targets();
         if targets.is_empty() {
             self.say("nothing to convert", WARN);
             return;
         }
+        if self.side == Side::Claude {
+            self.overlay = Overlay::Confirm(targets);
+        } else {
+            self.convert(targets);
+        }
+    }
+
+    /// Converts the given sessions of the current side, in list order.
+    fn convert(&mut self, paths: Vec<PathBuf>) {
+        let wanted: HashSet<PathBuf> = paths.into_iter().collect();
+        let targets: Vec<Located> = self
+            .rows()
+            .iter()
+            .filter(|row| wanted.contains(&row.path))
+            .map(Row::located)
+            .collect();
 
         let dry_run = self.dry_run;
         let force = self.force;
         let include_empty = self.include_empty;
         let mut converted = 0usize;
         let mut failed = 0usize;
-        for (path, id, cwd) in targets {
-            let located = Located {
-                side,
-                path,
-                id: id.clone(),
-                cwd,
-            };
+        let mut written = Vec::new();
+        for located in targets {
             match convert_one(&located, None, dry_run, force, include_empty) {
                 Ok(outcome) => {
                     if outcome.wrote() {
                         converted += 1;
+                        written.push(located.path.clone());
                     }
                     let color = if !outcome.wrote() {
                         DIM
@@ -275,7 +584,7 @@ impl App {
                 }
                 Err(error) => {
                     failed += 1;
-                    self.say(format!("{id}: {error:#}"), BAD);
+                    self.say(format!("{}: {error:#}", located.id), BAD);
                 }
             }
         }
@@ -284,13 +593,23 @@ impl App {
             if failed > 0 { BAD } else { OK },
         );
         if !dry_run && converted > 0 {
+            // An imported Claude session is in Pi now; leaving it checked
+            // would import it a second time on the next `x`.
+            if self.side == Side::Claude {
+                for path in &written {
+                    self.selected_claude.remove(path);
+                }
+            }
             self.refresh();
         }
     }
 
     /// Writes the cursor row as Markdown next to the tool's working directory.
     fn export_markdown(&mut self) {
-        let Some(row) = self.current() else { return };
+        let Some(row) = self.current() else {
+            self.say("move to a session to export it", WARN);
+            return;
+        };
         let (path, side, id, cwd, title) = (
             row.path.clone(),
             row.side,
@@ -301,6 +620,9 @@ impl App {
         let blocks = match side {
             Side::Dsh => dsh::read_log(&path).map(|log| transcript::from_dsh(&log)),
             Side::Pi => pi::read_file(&path).map(|file| transcript::from_pi(&file)),
+            Side::Claude => {
+                claude::read_records(&path).map(|records| transcript::from_claude(&records, false))
+            }
         };
         let blocks = match blocks {
             Ok(blocks) => blocks,
@@ -378,29 +700,23 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                 _ => {}
             },
             Overlay::Help => app.overlay = Overlay::None,
+            Overlay::Confirm(_) => {
+                let overlay = std::mem::replace(&mut app.overlay, Overlay::None);
+                match (key.code, overlay) {
+                    (KeyCode::Char('y') | KeyCode::Enter, Overlay::Confirm(paths)) => app.convert(paths),
+                    _ => app.say("import cancelled", DIM),
+                }
+            }
             Overlay::None => match key.code {
                 KeyCode::Char('q') => app.quit = true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.quit = true
                 }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    app.side = match app.side {
-                        Side::Dsh => Side::Pi,
-                        Side::Pi => Side::Dsh,
-                    };
-                    app.cursor = 0;
-                    app.reindex();
-                }
-                KeyCode::Char('1') => {
-                    app.side = Side::Dsh;
-                    app.cursor = 0;
-                    app.reindex();
-                }
-                KeyCode::Char('2') => {
-                    app.side = Side::Pi;
-                    app.cursor = 0;
-                    app.reindex();
-                }
+                KeyCode::Tab => app.cycle(true),
+                KeyCode::BackTab => app.cycle(false),
+                KeyCode::Char('1') => app.switch(Side::Dsh),
+                KeyCode::Char('2') => app.switch(Side::Pi),
+                KeyCode::Char('3') => app.switch(Side::Claude),
                 KeyCode::Char('j') | KeyCode::Down => {
                     if app.cursor + 1 < app.view.len() {
                         app.cursor += 1;
@@ -415,20 +731,11 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                 KeyCode::Char('G') | KeyCode::End => {
                     app.cursor = app.view.len().saturating_sub(1)
                 }
-                KeyCode::Char(' ') => {
-                    if let Some(path) = app.current().map(|row| row.path.clone()) {
-                        let selection = app.selection();
-                        if !selection.insert(path.clone()) {
-                            selection.remove(&path);
-                        }
-                    }
-                }
+                KeyCode::Char('h') | KeyCode::Left => app.fold(Some(true)),
+                KeyCode::Char('l') | KeyCode::Right => app.fold(Some(false)),
+                KeyCode::Char(' ') => app.toggle(),
                 KeyCode::Char('a') => {
-                    let paths: Vec<PathBuf> = app
-                        .view
-                        .iter()
-                        .map(|index| app.rows()[*index].path.clone())
-                        .collect();
+                    let paths = app.shown_paths();
                     let selection = app.selection();
                     for path in paths {
                         selection.insert(path);
@@ -441,8 +748,11 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                     app.editing_filter = true;
                     app.filter.clear();
                 }
-                KeyCode::Enter => app.open_preview(),
-                KeyCode::Char('x') => app.convert_selection(),
+                KeyCode::Enter => match app.view.get(app.cursor) {
+                    Some(Item::Project(_)) => app.fold(None),
+                    _ => app.open_preview(),
+                },
+                KeyCode::Char('x') => app.request_convert(),
                 KeyCode::Char('m') => app.export_markdown(),
                 KeyCode::Char('d') => {
                     app.dry_run = !app.dry_run;
@@ -469,7 +779,7 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                 }
                 KeyCode::Char('r') => {
                     app.refresh();
-                    app.say("rescanned both roots", ACCENT);
+                    app.say("rescanned every session root", ACCENT);
                 }
                 KeyCode::Char('?') => app.overlay = Overlay::Help,
                 _ => {}
@@ -503,9 +813,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_log(frame, chunks[2], app);
     draw_footer(frame, chunks[3], app);
 
-    match app.overlay {
+    match &app.overlay {
         Overlay::Preview => draw_preview(frame, area, app),
         Overlay::Help => draw_help(frame, area),
+        Overlay::Confirm(paths) => draw_confirm(frame, area, app, paths),
         Overlay::None => {}
     }
 }
@@ -514,11 +825,9 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let titles = vec![
         Line::from(format!(" DSH · {} ", app.dsh_rows.len())),
         Line::from(format!(" Pi · {} ", app.pi_rows.len())),
+        Line::from(format!(" Claude Code · {} ", app.claude_rows.len())),
     ];
-    let index = match app.side {
-        Side::Dsh => 0,
-        Side::Pi => 1,
-    };
+    let index = SIDES.iter().position(|s| *s == app.side).unwrap_or(0);
     let flags = format!(
         "{}{}{}",
         if app.dry_run { " [dry-run]" } else { "" },
@@ -534,7 +843,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .title(Span::styled(
-                    " dshpi — DSH ⇄ Pi sessions ",
+                    " dshpi — DSH ⇄ Pi ← Claude Code ",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ))
                 .title_top(Line::from(Span::styled(flags, Style::default().fg(WARN))).right_aligned()),
@@ -542,33 +851,114 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(tabs, area);
 }
 
+/// Marker and color for a Claude Code session's standing in Pi.
+fn verdict_mark(verdict: Option<&dedup::Verdict>) -> (&'static str, Color) {
+    match verdict {
+        Some(verdict) if verdict.is_duplicate() => ("=", WARN),
+        Some(dedup::Verdict::Overlap { .. }) => ("≈", WARN),
+        _ => (" ", DIM),
+    }
+}
+
+/// One list line for a DSH or Pi session.
+fn harness_line(app: &App, row: &Row) -> Line<'static> {
+    let selected = app.is_selected(&row.path);
+    let empty = row.empty;
+    let title = if empty {
+        "(no messages)".to_string()
+    } else if row.title.is_empty() {
+        "(untitled)".to_string()
+    } else {
+        row.title.clone()
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", if selected { "●" } else { "·" }),
+            Style::default().fg(if selected { OK } else { DIM }),
+        ),
+        Span::styled(format!("{:<10} ", &row.when[..10.min(row.when.len())]), Style::default().fg(DIM)),
+        Span::styled(
+            format!("{:<30} ", shorten(&title, 30)),
+            Style::default().fg(if empty { DIM } else { Color::White }),
+        ),
+        Span::styled(shorten(&row.cwd, 34), Style::default().fg(DIM)),
+    ])
+}
+
+/// One list line for a Claude Code project heading.
+fn project_line(app: &App, project: usize, width: usize) -> Line<'static> {
+    let rows = app.project_rows(project);
+    let held = rows
+        .iter()
+        .filter(|index| app.claude_rows[**index].duplicate())
+        .count();
+    let check = app.check_state(project);
+    let summary = format!(
+        "  {} session{}{}",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        if held > 0 { format!(" · {held} in Pi") } else { String::new() }
+    );
+    let cwd_width = width.saturating_sub(8 + summary.chars().count()).max(12);
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", if app.expanded(project) { "▾" } else { "▸" }),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            format!("{} ", check.glyph()),
+            Style::default().fg(if check == Check::None { DIM } else { OK }),
+        ),
+        Span::styled(
+            shorten(&app.projects[project].cwd, cwd_width),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(summary, Style::default().fg(DIM)),
+    ])
+}
+
+/// One list line for a Claude Code session, indented under its project.
+fn claude_line(app: &App, row: &Row, width: usize) -> Line<'static> {
+    let selected = app.is_selected(&row.path);
+    let (mark, mark_color) = verdict_mark(row.verdict.as_ref());
+    let empty = row.empty;
+    let title = if empty && !row.named {
+        format!("(no reply) {}", row.title)
+    } else {
+        row.title.clone()
+    };
+    let style = if empty {
+        Style::default().fg(DIM)
+    } else if row.named {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
+    };
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("{} ", if selected { "[x]" } else { "[ ]" }),
+            Style::default().fg(if selected { OK } else { DIM }),
+        ),
+        Span::styled(format!("{:<10} ", &row.when[..10.min(row.when.len())]), Style::default().fg(DIM)),
+        Span::styled(format!("{mark} "), Style::default().fg(mark_color).add_modifier(Modifier::BOLD)),
+        Span::styled(clip(&title, width.saturating_sub(23).max(10)), style),
+    ])
+}
+
 fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = app
         .view
         .iter()
-        .map(|index| {
-            let row = &app.rows()[*index];
-            let mark = if app.is_selected(&row.path) { "●" } else { "·" };
-            let empty = row.messages == 0;
-            let title = if empty {
-                "(no messages)".to_string()
-            } else if row.title.is_empty() {
-                "(untitled)".to_string()
-            } else {
-                row.title.clone()
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{mark} "),
-                    Style::default().fg(if app.is_selected(&row.path) { OK } else { DIM }),
-                ),
-                Span::styled(format!("{:<10} ", &row.when[..10.min(row.when.len())]), Style::default().fg(DIM)),
-                Span::styled(
-                    format!("{:<30} ", shorten(&title, 30)),
-                    Style::default().fg(if empty { DIM } else { Color::White }),
-                ),
-                Span::styled(shorten(&row.cwd, 34), Style::default().fg(DIM)),
-            ]))
+        .map(|item| {
+            ListItem::new(match *item {
+                Item::Project(project) => project_line(app, project, width),
+                Item::Row(index) if app.side == Side::Claude => {
+                    claude_line(app, &app.claude_rows[index], width)
+                }
+                Item::Row(index) => harness_line(app, &app.rows()[index]),
+            })
         })
         .collect();
 
@@ -576,10 +966,15 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
     if !app.view.is_empty() {
         state.select(Some(app.cursor));
     }
+    let count = app.view.iter().filter(|item| matches!(item, Item::Row(_))).count();
+    let checked = match app.side {
+        Side::Claude => format!(" · {} checked", app.selected_claude.len()),
+        _ => String::new(),
+    };
     let heading = if app.filter.is_empty() {
-        format!(" sessions · {} ", app.view.len())
+        format!(" sessions · {count}{checked} ")
     } else {
-        format!(" sessions · {} matching {:?} ", app.view.len(), app.filter)
+        format!(" sessions · {count} matching {:?}{checked} ", app.filter)
     };
     let list = List::new(items)
         .block(
@@ -595,19 +990,46 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// Detail lines for a Claude Code project heading.
+fn project_detail(app: &App, project: usize) -> Vec<Line<'static>> {
+    let all = &app.projects[project].rows;
+    let rows = app.project_rows(project);
+    let count = |keep: &dyn Fn(&Row) -> bool| {
+        rows.iter().filter(|index| keep(&app.claude_rows[**index])).count()
+    };
+    let checked = count(&|row| app.selected_claude.contains(&row.path));
+    let held = count(&|row| row.duplicate());
+    let partial = count(&|row| matches!(row.verdict, Some(dedup::Verdict::Overlap { .. })));
+    let buckets: HashSet<&str> = all.iter().map(|i| app.claude_rows[*i].bucket.as_str()).collect();
+    let mut buckets: Vec<&str> = buckets.into_iter().collect();
+    buckets.sort_unstable();
+    let mut lines = vec![
+        field("cwd", &app.projects[project].cwd),
+        field("shown", &format!("{} of {} sessions", rows.len(), all.len())),
+        field("check", &format!("{checked} checked")),
+        field("in Pi", &format!("{held} already, {partial} partly")),
+        field("proj", &buckets.join(", ")),
+        Line::from(""),
+    ];
+    if held > 0 {
+        lines.push(Line::from(Span::styled(
+            "= sessions start unchecked: Pi already holds them",
+            Style::default().fg(WARN),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "space checks or unchecks every shown session",
+        Style::default().fg(DIM),
+    )));
+    lines
+}
+
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let text = match app.current() {
-        None => Text::from("no session selected"),
-        Some(row) => {
-            let destination = crate::destination(
-                &Located {
-                    side: row.side,
-                    path: row.path.clone(),
-                    id: row.id.clone(),
-                    cwd: row.cwd.clone(),
-                },
-                None,
-            );
+    let lines: Vec<Line> = match (app.view.get(app.cursor), app.current()) {
+        (Some(Item::Project(project)), _) => project_detail(app, *project),
+        (_, None) => vec![Line::from("no session selected")],
+        (_, Some(row)) => {
+            let destination = crate::destination(&row.located(), None);
             let mut lines = vec![
                 field("id", &row.id),
                 field("cwd", &row.cwd),
@@ -616,6 +1038,28 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                 field("rows", &format!("{} · {} messages", row.detail, row.messages)),
                 field("size", &human_size(row.size)),
             ];
+            if row.side == Side::Claude && !row.named {
+                lines.push(field("name", "(none — showing the first prompt)"));
+            }
+            if let Some(verdict) = &row.verdict {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("in Pi", Style::default().fg(ACCENT))));
+                match verdict.describe() {
+                    None => lines.push(Line::from(Span::styled(
+                        "no copy found",
+                        Style::default().fg(DIM),
+                    ))),
+                    Some(reason) => {
+                        lines.push(Line::from(Span::styled(reason, Style::default().fg(WARN))));
+                        if let Some(twin) = verdict.twin() {
+                            lines.push(Line::from(Span::styled(
+                                twin.path.display().to_string(),
+                                Style::default().fg(DIM),
+                            )));
+                        }
+                    }
+                }
+            }
             lines.extend([
                 Line::from(""),
                 Line::from(Span::styled("source", Style::default().fg(ACCENT))),
@@ -628,6 +1072,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                     match row.side {
                         Side::Dsh => "converts to Pi",
                         Side::Pi => "converts to DSH",
+                        Side::Claude => "imports to Pi",
                     },
                     Style::default().fg(ACCENT),
                 )),
@@ -651,10 +1096,10 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(BAD),
                 ))),
             }
-            Text::from(lines)
+            lines
         }
     };
-    let paragraph = Paragraph::new(text)
+    let paragraph = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
         .block(
             Block::bordered()
@@ -682,6 +1127,8 @@ fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.editing_filter {
         format!("filter: {}▏ (enter to apply, esc to clear)", app.filter)
+    } else if app.side == Side::Claude {
+        "tab switch · space check · ←/→ fold · a all · A none · x import checked · enter preview · m markdown · d dry-run · f overwrite · e empty · r rescan · ? help · q quit".to_string()
     } else {
         "tab switch · space select · a all · x convert · enter preview · m markdown · d dry-run · f overwrite · e empty · r rescan · ? help · q quit".to_string()
     };
@@ -689,6 +1136,58 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Span::styled(text, Style::default().fg(DIM))),
         area,
     );
+}
+
+fn draw_confirm(frame: &mut Frame, area: Rect, app: &App, paths: &[PathBuf]) {
+    let area = centered(area, 56, 30);
+    frame.render_widget(Clear, area);
+    let wanted: HashSet<&PathBuf> = paths.iter().collect();
+    let chosen: Vec<&Row> = app
+        .claude_rows
+        .iter()
+        .filter(|row| wanted.contains(&row.path))
+        .collect();
+    let held = chosen.iter().filter(|row| row.duplicate()).count();
+    let projects: HashSet<&str> = chosen.iter().map(|row| row.cwd.as_str()).collect();
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "Import {} Claude Code session(s) from {} project(s) into Pi?",
+                chosen.len(),
+                projects.len()
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if held > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("{held} of them Pi already holds; importing adds a second copy"),
+            Style::default().fg(WARN),
+        )));
+    }
+    if app.dry_run {
+        lines.push(Line::from(Span::styled(
+            "dry-run is on: nothing will be written",
+            Style::default().fg(WARN),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "y / enter import · any other key cancels",
+        Style::default().fg(DIM),
+    )));
+    let paragraph = Paragraph::new(Text::from(lines))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" import ")
+                .title_alignment(Alignment::Center),
+        );
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
@@ -758,22 +1257,25 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let area = centered(area, 60, 70);
+    let area = centered(area, 64, 80);
     frame.render_widget(Clear, area);
     let rows = [
-        ("tab / 1 / 2", "switch between DSH and Pi"),
+        ("tab / 1 2 3", "switch between DSH, Pi, and Claude Code"),
         ("j k ↑ ↓", "move"),
         ("g G", "first / last"),
-        ("space", "toggle selection"),
+        ("space", "toggle selection; on a project, every shown session"),
         ("a / A", "select all shown / clear selection"),
         ("/", "filter by id, title, or cwd"),
-        ("enter", "preview the transcript"),
+        ("enter", "preview the transcript; on a project, fold it"),
+        ("← → / h l", "fold / unfold a Claude Code project"),
         ("x", "convert selection (or cursor) to the other harness"),
+        ("", "on Claude Code: import the checked sessions into Pi"),
+        ("= ≈", "Claude Code session already / partly in Pi"),
         ("m", "write ./exports/<id>.md"),
         ("d", "toggle dry-run"),
         ("f", "toggle overwrite of an existing destination"),
         ("e", "show sessions that hold no conversation (hidden by default)"),
-        ("r", "rescan both session roots"),
+        ("r", "rescan every session root"),
         ("q", "quit"),
     ];
     let lines: Vec<Line> = rows

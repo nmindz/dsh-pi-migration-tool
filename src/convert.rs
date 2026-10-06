@@ -58,20 +58,20 @@ pub fn from_iso(text: &str) -> Option<i64> {
 
 /// Assigns the 8-hex entry ids Pi uses, derived from the source so repeated
 /// conversions of one session produce byte-identical output.
-struct IdMinter {
+pub(crate) struct IdMinter {
     session: String,
     used: HashSet<String>,
 }
 
 impl IdMinter {
-    fn new(session: &str) -> Self {
+    pub(crate) fn new(session: &str) -> Self {
         Self {
             session: session.to_string(),
             used: HashSet::new(),
         }
     }
 
-    fn mint(&mut self, discriminator: &str) -> String {
+    pub(crate) fn mint(&mut self, discriminator: &str) -> String {
         for nonce in 0u32.. {
             let mut hasher = Sha256::new();
             hasher.update(self.session.as_bytes());
@@ -567,6 +567,7 @@ pub fn dsh_to_pi(log: &dsh::Log, source: &Path) -> (pi::SessionFile, Report) {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| iso(log.header.created_at));
+    let mut title_source: Option<String> = None;
     let mut system_emitted = false;
     let mut pending_pruned_tokens: i64 = 0;
     let mut compaction_positions: Vec<usize> = Vec::new();
@@ -607,13 +608,11 @@ pub fn dsh_to_pi(log: &dsh::Log, source: &Path) -> (pi::SessionFile, Report) {
                     .and_then(|s| s.get("kind"))
                     .and_then(Value::as_str)
                     .unwrap_or("auto");
+                let source = if source_kind == "user" { "user" } else { "auto" };
                 let mut fields = Map::new();
                 fields.insert("type".into(), json!("title_change"));
                 fields.insert("title".into(), json!(next));
-                fields.insert(
-                    "source".into(),
-                    json!(if source_kind == "user" { "user" } else { "auto" }),
-                );
+                fields.insert("source".into(), json!(source));
                 if !title.is_empty() {
                     fields.insert("previousTitle".into(), json!(title));
                 }
@@ -621,6 +620,7 @@ pub fn dsh_to_pi(log: &dsh::Log, source: &Path) -> (pi::SessionFile, Report) {
                 fields.insert("dsh".into(), provenance(event, strip(&event.data, &["title"])));
                 builder.push(&disc, event.time, fields);
                 title = next;
+                title_source = Some(source.to_string());
                 title_updated_at = iso(event.time);
             }
             "model/selection" => {
@@ -911,11 +911,17 @@ pub fn dsh_to_pi(log: &dsh::Log, source: &Path) -> (pi::SessionFile, Report) {
     if title.is_empty() && saved_title.is_none() {
         title = first_prompt_title(log);
     }
+    // A Pi session restores the source its own slot carried; a DSH log takes
+    // it from whichever title event set the final title.
+    if let Some(saved) = saved_title {
+        title_source = saved.get("source").and_then(Value::as_str).map(str::to_string);
+    }
     report.rows = builder.entries.len();
 
     (
         pi::SessionFile {
             title,
+            title_source,
             title_updated_at,
             header,
             entries: builder.entries,
@@ -1082,10 +1088,11 @@ pub fn pi_to_dsh(file: &pi::SessionFile, follow_leaf: bool) -> (dsh::Log, Report
             // DSH headers are open objects, so a Pi session keeps its own header
             // and title here instead of losing the fields DSH has no slot for.
             raw.insert("piHeader".into(), Value::Object(file.header.clone()));
-            raw.insert(
-                "piTitle".into(),
-                json!({ "title": file.title, "updatedAt": file.title_updated_at }),
-            );
+            let mut saved_title = json!({ "title": file.title, "updatedAt": file.title_updated_at });
+            if let Some(source) = &file.title_source {
+                saved_title["source"] = json!(source);
+            }
+            raw.insert("piTitle".into(), saved_title);
             dsh::Header {
                 version: dsh::CURRENT_GENERATION,
                 id: file.id().to_string(),
@@ -1807,6 +1814,7 @@ mod tests {
     fn native_pi_sessions_gain_turn_and_step_scaffolding() {
         let file = pi::SessionFile {
             title: "t".into(),
+            title_source: None,
             title_updated_at: iso(1_700_000_000_000),
             header: pi::make_header("p1", &iso(1_700_000_000_000), "/work/x", &[]),
             entries: vec![
