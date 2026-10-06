@@ -134,6 +134,7 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => tui::run(),
@@ -180,6 +181,20 @@ fn main() -> Result<()> {
             format,
             out,
         } => export(&session, format, out.as_deref()),
+    }
+}
+
+/// Lets a listing end quietly when its reader closes the pipe.
+///
+/// Rust ignores `SIGPIPE`, which turns `dshpi list | head` into a panic from
+/// inside `println!`. Restoring the default disposition before any output
+/// starts gives the ordinary CLI behavior.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: called once, before any thread or I/O exists, with a disposition
+    // constant the platform defines for this signal.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

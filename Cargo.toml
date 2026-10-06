@@ -23,6 +23,9 @@ sha2 = "0.10"
 walkdir = "2"
 zstd = "0.13"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

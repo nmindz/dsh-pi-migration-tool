@@ -327,6 +327,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
