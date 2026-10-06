@@ -74,6 +74,9 @@ enum Command {
         /// Overwrite an existing destination file.
         #[arg(long)]
         force: bool,
+        /// Also convert sessions that hold no conversation.
+        #[arg(long)]
+        include_empty: bool,
     },
     /// Convert every session of one harness.
     ConvertAll {
@@ -92,6 +95,18 @@ enum Command {
         /// Overwrite existing destination files.
         #[arg(long)]
         force: bool,
+        /// Also convert sessions that hold no conversation.
+        #[arg(long)]
+        include_empty: bool,
+    },
+    /// Delete migrated sessions that hold no conversation.
+    PruneEmpty {
+        /// Keep only sessions whose title, cwd, or id contains this text.
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Delete the listed files; without it the command only reports them.
+        #[arg(long)]
+        execute: bool,
     },
     /// Convert every session out and back, reporting any row that changed.
     Verify {
@@ -129,6 +144,7 @@ fn main() -> Result<()> {
             out,
             dry_run,
             force,
+            include_empty,
         } => {
             let located = locate(&session)?;
             let to = to.unwrap_or(match located.side {
@@ -138,7 +154,7 @@ fn main() -> Result<()> {
             if to == located.side {
                 bail!("source and destination are both {:?}", to);
             }
-            let outcome = convert_one(&located, out.as_deref(), dry_run, force)?;
+            let outcome = convert_one(&located, out.as_deref(), dry_run, force, include_empty)?;
             println!("{outcome}");
             Ok(())
         }
@@ -148,7 +164,16 @@ fn main() -> Result<()> {
             out,
             dry_run,
             force,
-        } => convert_all(from, filter.as_deref(), out.as_deref(), dry_run, force),
+            include_empty,
+        } => convert_all(
+            from,
+            filter.as_deref(),
+            out.as_deref(),
+            dry_run,
+            force,
+            include_empty,
+        ),
+        Command::PruneEmpty { filter, execute } => prune_empty(filter.as_deref(), execute),
         Command::Verify { side, filter, all } => verify(side, filter.as_deref(), all),
         Command::Export {
             session,
@@ -244,48 +269,151 @@ pub fn destination(located: &Located, out: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// What one conversion did.
+pub enum Outcome {
+    /// The destination was written, or would be under `--dry-run`.
+    Written(String),
+    /// The source held no conversation and was left alone.
+    Skipped(String),
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Written(line) => write!(out, "{line}"),
+            Outcome::Skipped(line) => write!(out, "{line}"),
+        }
+    }
+}
+
+impl Outcome {
+    /// True when the destination was written.
+    pub fn wrote(&self) -> bool {
+        matches!(self, Outcome::Written(_))
+    }
+}
+
 /// Converts one session and reports what happened.
+///
+/// A session that holds no conversation is skipped unless `include_empty` is
+/// set: cancelled and never-used launches leave behind logs of nothing but
+/// startup records, and importing them buries the real sessions.
 pub fn convert_one(
     located: &Located,
     out: Option<&Path>,
     dry_run: bool,
     force: bool,
-) -> Result<String> {
+    include_empty: bool,
+) -> Result<Outcome> {
     let target = destination(located, out)?;
-    if target.exists() && !force && !dry_run {
-        bail!("{} already exists; pass --force to overwrite", target.display());
-    }
-    if dry_run {
-        return Ok(format!("[dry-run] {} -> {}", located.id, target.display()));
-    }
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+
     match located.side {
         Side::Dsh => {
             let log = dsh::read_log(&located.path)?;
             let (file, report) = convert::dsh_to_pi(&log, &located.path);
-            pi::write_file(&target, &file)?;
-            Ok(format!(
-                "{} -> {} ({} entries: {} mapped, {} carried)",
+            if !include_empty && file.message_count() == 0 {
+                return Ok(Outcome::Skipped(format!(
+                    "{} skipped: no conversation",
+                    located.id
+                )));
+            }
+            guard_destination(&target, force, dry_run)?;
+            if !dry_run {
+                pi::write_file(&target, &file)?;
+            }
+            Ok(Outcome::Written(format!(
+                "{prefix}{} -> {} ({} entries: {} mapped, {} carried)",
                 located.id,
                 target.display(),
                 report.rows,
                 report.mapped,
                 report.passthrough
-            ))
+            )))
         }
         Side::Pi => {
             let file = pi::read_file(&located.path)?;
             let (log, report) = convert::pi_to_dsh(&file, false);
-            dsh::write_log(&target, &log, 10)?;
-            Ok(format!(
-                "{} -> {} ({} events: {} mapped, {} restored)",
+            if !include_empty && log.message_count() == 0 {
+                return Ok(Outcome::Skipped(format!(
+                    "{} skipped: no conversation",
+                    located.id
+                )));
+            }
+            guard_destination(&target, force, dry_run)?;
+            if !dry_run {
+                dsh::write_log(&target, &log, 10)?;
+            }
+            Ok(Outcome::Written(format!(
+                "{prefix}{} -> {} ({} events: {} mapped, {} restored)",
                 located.id,
                 target.display(),
                 report.rows,
                 report.mapped,
                 report.passthrough
-            ))
+            )))
         }
     }
+}
+
+/// Refuses to clobber an existing destination unless asked to.
+fn guard_destination(target: &Path, force: bool, dry_run: bool) -> Result<()> {
+    if target.exists() && !force && !dry_run {
+        bail!("{} already exists; pass --force to overwrite", target.display());
+    }
+    Ok(())
+}
+
+/// Deletes migrated Pi sessions that hold no conversation.
+///
+/// Only sessions this tool wrote are candidates, so a native Pi session is
+/// never removed even when it is empty.
+fn prune_empty(filter: Option<&str>, execute: bool) -> Result<()> {
+    let needle = filter.map(str::to_lowercase);
+    let keep = |fields: &[&str]| match &needle {
+        None => true,
+        Some(needle) => fields.iter().any(|f| f.to_lowercase().contains(needle)),
+    };
+
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    for found in pi::discover(&paths::pi_root()) {
+        if !found.migrated || found.messages > 0 {
+            continue;
+        }
+        if !keep(&[&found.id, &found.cwd, &found.title]) {
+            continue;
+        }
+        // Re-read before deleting: discovery streams, this confirms.
+        let file = pi::read_file(&found.path)?;
+        if !file.is_migrated() || file.message_count() > 0 {
+            continue;
+        }
+        println!(
+            "{} {} ({} entries, {})",
+            if execute { "removed" } else { "[dry-run]" },
+            found.path.display(),
+            found.entries,
+            found.size
+        );
+        removed += 1;
+        bytes += found.size;
+        if execute {
+            std::fs::remove_file(&found.path)
+                .with_context(|| format!("remove {}", found.path.display()))?;
+            if let Some(parent) = found.path.parent() {
+                // Succeeds only when the directory is now empty.
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+    println!(
+        "{} empty migrated session(s), {} bytes{}",
+        removed,
+        bytes,
+        if execute { " removed" } else { "; pass --execute to delete" }
+    );
+    Ok(())
 }
 
 /// Lists sessions on one or both sides.
@@ -306,10 +434,11 @@ fn list(side: Option<Side>, filter: Option<&str>) -> Result<()> {
                 continue;
             }
             println!(
-                "{:<38} v{} {:>6} evt  {:<28} {}",
+                "{:<38} v{} {:>6} evt {:>5} msg  {:<28} {}",
                 found.id,
                 found.generation,
                 found.events,
+                found.messages,
                 shorten(&found.cwd, 28),
                 title
             );
@@ -322,9 +451,10 @@ fn list(side: Option<Side>, filter: Option<&str>) -> Result<()> {
                 continue;
             }
             println!(
-                "{:<38}    {:>6} evt  {:<28} {}",
+                "{:<38}    {:>6} evt {:>5} msg  {:<28} {}",
                 found.id,
                 found.entries,
+                found.messages,
                 shorten(&found.cwd, 28),
                 found.title
             );
@@ -340,6 +470,7 @@ fn convert_all(
     out: Option<&Path>,
     dry_run: bool,
     force: bool,
+    include_empty: bool,
 ) -> Result<()> {
     let needle = filter.map(str::to_lowercase);
     let keep = |fields: &[&str]| match &needle {
@@ -374,16 +505,26 @@ fn convert_all(
     };
 
     let mut failures = 0usize;
+    let mut skipped = 0usize;
     for located in &targets {
-        match convert_one(located, out, dry_run, force) {
-            Ok(line) => println!("{line}"),
+        match convert_one(located, out, dry_run, force, include_empty) {
+            Ok(outcome) => {
+                if !outcome.wrote() {
+                    skipped += 1;
+                }
+                println!("{outcome}");
+            }
             Err(error) => {
                 failures += 1;
                 eprintln!("{}: {error:#}", located.id);
             }
         }
     }
-    println!("{} session(s), {failures} failed", targets.len());
+    println!(
+        "{} session(s), {} converted, {skipped} empty, {failures} failed",
+        targets.len(),
+        targets.len() - skipped - failures
+    );
     if failures > 0 {
         bail!("{failures} conversion(s) failed");
     }

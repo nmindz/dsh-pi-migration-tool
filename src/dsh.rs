@@ -121,6 +121,16 @@ impl Log {
         out
     }
 
+    /// Number of conversation messages, the measure of whether a session holds
+    /// anything a reader would want. Tool traffic without a prompt or a reply
+    /// does not count.
+    pub fn message_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "user/message" | "assistant/message"))
+            .count()
+    }
+
     /// Latest recorded session title, when the log set one.
     pub fn title(&self) -> Option<String> {
         self.events
@@ -155,6 +165,8 @@ pub struct SessionRef {
     pub size: u64,
     /// Number of events, counted during discovery.
     pub events: usize,
+    /// Number of conversation messages, counted during discovery.
+    pub messages: usize,
 }
 
 /// Decodes a zstd-framed JSONL log into its header and events.
@@ -314,6 +326,7 @@ fn inspect_session_dir(dir: &Path, bucket: &str) -> Option<SessionRef> {
         title: scan.title,
         size,
         events: scan.events,
+        messages: scan.messages,
     })
 }
 
@@ -322,6 +335,7 @@ struct LightScan {
     header: Header,
     title: Option<String>,
     events: usize,
+    messages: usize,
 }
 
 /// Streams a log, parsing only the header and any `session/title` rows.
@@ -334,6 +348,7 @@ fn scan_light(path: &Path) -> Result<LightScan> {
     let mut header: Option<Header> = None;
     let mut title = None;
     let mut events = 0usize;
+    let mut messages = 0usize;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
@@ -347,6 +362,11 @@ fn scan_light(path: &Path) -> Result<LightScan> {
             continue;
         }
         events += 1;
+        if trimmed.starts_with("{\"type\":\"user/message\"")
+            || trimmed.starts_with("{\"type\":\"assistant/message\"")
+        {
+            messages += 1;
+        }
         if trimmed.starts_with("{\"type\":\"session/title\"") {
             if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
                 if let Some(found) = value
@@ -364,6 +384,7 @@ fn scan_light(path: &Path) -> Result<LightScan> {
         header: header.ok_or_else(|| anyhow!("{} is empty", path.display()))?,
         title,
         events,
+        messages,
     })
 }
 

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use walkdir::WalkDir;
+
+use crate::convert::ORIGIN_TYPE;
 use serde_json::{json, Map, Value};
 
 /// Session format version this tool emits.
@@ -49,6 +51,22 @@ impl SessionFile {
             .get("timestamp")
             .and_then(Value::as_str)
             .unwrap_or("")
+    }
+
+    /// Number of conversation messages. A session with none is the empty shell
+    /// a cancelled or never-used launch leaves behind.
+    pub fn message_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.get("type").and_then(Value::as_str) == Some("message"))
+            .count()
+    }
+
+    /// True when this file was produced by converting a DSH session.
+    pub fn is_migrated(&self) -> bool {
+        self.entries.iter().any(|e| {
+            e.get("customType").and_then(Value::as_str) == Some(ORIGIN_TYPE)
+        })
     }
 
     /// Counts entries by type, with message entries split by role.
@@ -99,6 +117,10 @@ pub struct SessionRef {
     pub size: u64,
     /// Number of entry rows, excluding the title slot and header.
     pub entries: usize,
+    /// Number of conversation messages, counted during discovery.
+    pub messages: usize,
+    /// True when this file was produced by converting a DSH session.
+    pub migrated: bool,
 }
 
 /// Builds the fixed-width title slot line, truncating an over-long title.
@@ -258,6 +280,8 @@ fn inspect(path: &Path, bucket: &str) -> Option<SessionRef> {
     let mut title = String::new();
     let mut header: Option<Value> = None;
     let mut entries = 0usize;
+    let mut messages = 0usize;
+    let mut migrated = false;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
@@ -280,6 +304,11 @@ fn inspect(path: &Path, bucket: &str) -> Option<SessionRef> {
             continue;
         }
         entries += 1;
+        if trimmed.starts_with("{\"type\":\"message\"") {
+            messages += 1;
+        } else if !migrated && trimmed.contains(ORIGIN_TYPE) {
+            migrated = true;
+        }
     }
 
     let header = header?;
@@ -304,6 +333,8 @@ fn inspect(path: &Path, bucket: &str) -> Option<SessionRef> {
         title,
         size,
         entries,
+        messages,
+        migrated,
     })
 }
 

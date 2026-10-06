@@ -31,6 +31,7 @@ struct Row {
     cwd: String,
     when: String,
     detail: String,
+    messages: usize,
     bucket: String,
     size: u64,
     path: PathBuf,
@@ -67,6 +68,7 @@ struct App {
     log: Vec<(String, Color)>,
     dry_run: bool,
     force: bool,
+    include_empty: bool,
     quit: bool,
 }
 
@@ -90,6 +92,7 @@ impl App {
             log: Vec::new(),
             dry_run: false,
             force: false,
+            include_empty: false,
             quit: false,
         };
         app.refresh();
@@ -115,6 +118,7 @@ impl App {
                     },
                     found.events
                 ),
+                messages: found.messages,
                 bucket: found.bucket,
                 size: found.size,
                 path: found.path,
@@ -129,6 +133,7 @@ impl App {
                 cwd: found.cwd,
                 when: found.timestamp,
                 detail: format!("{} entries", found.entries),
+                messages: found.messages,
                 bucket: found.bucket,
                 size: found.size,
                 path: found.path,
@@ -169,6 +174,7 @@ impl App {
             .rows()
             .iter()
             .enumerate()
+            .filter(|(_, row)| self.include_empty || row.messages > 0)
             .filter(|(_, row)| {
                 needle.is_empty()
                     || row.id.to_lowercase().contains(&needle)
@@ -243,6 +249,7 @@ impl App {
 
         let dry_run = self.dry_run;
         let force = self.force;
+        let include_empty = self.include_empty;
         let mut converted = 0usize;
         let mut failed = 0usize;
         for (path, id, cwd) in targets {
@@ -252,10 +259,19 @@ impl App {
                 id: id.clone(),
                 cwd,
             };
-            match convert_one(&located, None, dry_run, force) {
-                Ok(line) => {
-                    converted += 1;
-                    self.say(line, if dry_run { WARN } else { OK });
+            match convert_one(&located, None, dry_run, force, include_empty) {
+                Ok(outcome) => {
+                    if outcome.wrote() {
+                        converted += 1;
+                    }
+                    let color = if !outcome.wrote() {
+                        DIM
+                    } else if dry_run {
+                        WARN
+                    } else {
+                        OK
+                    };
+                    self.say(outcome.to_string(), color);
                 }
                 Err(error) => {
                     failed += 1;
@@ -438,6 +454,19 @@ fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                     let state = app.force;
                     app.say(format!("overwrite {}", if state { "on" } else { "off" }), WARN);
                 }
+                KeyCode::Char('e') => {
+                    app.include_empty = !app.include_empty;
+                    app.cursor = 0;
+                    app.reindex();
+                    let state = app.include_empty;
+                    app.say(
+                        format!(
+                            "sessions without a conversation {}",
+                            if state { "shown" } else { "hidden" }
+                        ),
+                        WARN,
+                    );
+                }
                 KeyCode::Char('r') => {
                     app.refresh();
                     app.say("rescanned both roots", ACCENT);
@@ -491,9 +520,10 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
         Side::Pi => 1,
     };
     let flags = format!(
-        "{}{}",
+        "{}{}{}",
         if app.dry_run { " [dry-run]" } else { "" },
-        if app.force { " [overwrite]" } else { "" }
+        if app.force { " [overwrite]" } else { "" },
+        if app.include_empty { " [+empty]" } else { "" }
     );
     let tabs = Tabs::new(titles)
         .select(index)
@@ -519,7 +549,10 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
         .map(|index| {
             let row = &app.rows()[*index];
             let mark = if app.is_selected(&row.path) { "●" } else { "·" };
-            let title = if row.title.is_empty() {
+            let empty = row.messages == 0;
+            let title = if empty {
+                "(no messages)".to_string()
+            } else if row.title.is_empty() {
                 "(untitled)".to_string()
             } else {
                 row.title.clone()
@@ -532,7 +565,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!("{:<10} ", &row.when[..10.min(row.when.len())]), Style::default().fg(DIM)),
                 Span::styled(
                     format!("{:<30} ", shorten(&title, 30)),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(if empty { DIM } else { Color::White }),
                 ),
                 Span::styled(shorten(&row.cwd, 34), Style::default().fg(DIM)),
             ]))
@@ -580,7 +613,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                 field("cwd", &row.cwd),
                 field("when", &row.when),
                 field("proj", &row.bucket),
-                field("rows", &row.detail),
+                field("rows", &format!("{} · {} messages", row.detail, row.messages)),
                 field("size", &human_size(row.size)),
             ];
             lines.extend([
@@ -650,7 +683,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.editing_filter {
         format!("filter: {}▏ (enter to apply, esc to clear)", app.filter)
     } else {
-        "tab switch · space select · a all · x convert · enter preview · m markdown · d dry-run · f overwrite · r rescan · ? help · q quit".to_string()
+        "tab switch · space select · a all · x convert · enter preview · m markdown · d dry-run · f overwrite · e empty · r rescan · ? help · q quit".to_string()
     };
     frame.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(DIM))),
@@ -739,6 +772,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("m", "write ./exports/<id>.md"),
         ("d", "toggle dry-run"),
         ("f", "toggle overwrite of an existing destination"),
+        ("e", "show sessions that hold no conversation (hidden by default)"),
         ("r", "rescan both session roots"),
         ("q", "quit"),
     ];

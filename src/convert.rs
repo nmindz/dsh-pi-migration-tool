@@ -1829,6 +1829,37 @@ mod tests {
     }
 
     #[test]
+    fn a_startup_only_log_carries_no_conversation() {
+        let mut raw = Map::new();
+        raw.insert("type".into(), json!("session"));
+        raw.insert("version".into(), json!(4));
+        raw.insert("id".into(), json!("empty-1"));
+        raw.insert("createdAt".into(), json!(1_700_000_000_000i64));
+        raw.insert("cwd".into(), json!("/w"));
+        let log = dsh::Log {
+            header: dsh::Header {
+                version: 4,
+                id: "empty-1".into(),
+                created_at: 1_700_000_000_000,
+                cwd: "/w".into(),
+                raw,
+            },
+            events: vec![
+                dsh_event("permission/preset", 0, json!({"preset": "danger-full-access"}), &[]),
+                dsh_event("sandbox/mode", 1, json!({"mode": "danger-full-access"}), &[]),
+                dsh_event("approval/policy", 2, json!({"policy": "never"}), &[]),
+            ],
+        };
+        assert_eq!(log.message_count(), 0);
+        let (file, _) = dsh_to_pi(&log, Path::new("/tmp/s.zstd"));
+        assert_eq!(file.message_count(), 0, "startup records are not a conversation");
+        assert!(file.title.is_empty());
+
+        let (back, _) = pi_to_dsh(&file, false);
+        assert_eq!(back.message_count(), 0);
+    }
+
+    #[test]
     fn leaf_chain_follows_parent_pointers() {
         let entries = vec![
             json!({"id": "a", "parentId": null}),

@@ -46,6 +46,7 @@ Session roots are discovered from `~/.dsh` and `~/.omp`, overridable with `DSH_H
 | `m` | write `./exports/<id>.md` |
 | `d` | toggle dry-run |
 | `f` | allow overwriting an existing destination |
+| `e` | show sessions that hold no conversation (hidden by default) |
 | `r` | rescan both roots |
 | `?` / `q` | keys / quit |
 
@@ -56,14 +57,21 @@ The detail pane shows where a session would land and warns when that file alread
 ```sh
 dshpi list [dsh|pi] [--filter TEXT]
 
-dshpi convert <id-or-path> [--to dsh|pi] [--out DIR] [--dry-run] [--force]
-dshpi convert-all <dsh|pi> [--filter TEXT] [--out DIR] [--dry-run] [--force]
+dshpi convert <id-or-path> [--to dsh|pi] [--out DIR] [--dry-run] [--force] [--include-empty]
+dshpi convert-all <dsh|pi> [--filter TEXT] [--out DIR] [--dry-run] [--force] [--include-empty]
 
+dshpi prune-empty [--filter TEXT] [--execute]
 dshpi verify [dsh|pi] [--filter TEXT] [--all]
 dshpi export <id-or-path> [--format md|text] [-o FILE]
 ```
 
 `<id-or-path>` accepts a session-id prefix or a path to a session file; the direction is inferred from the source. Without `--out`, conversions write into the other harness's real session root, so the result is immediately listed and resumable there.
+
+### Empty sessions
+
+A cancelled or never-used launch leaves behind a log holding nothing but startup records — permission preset, sandbox mode, approval policy — and no prompt or reply. Importing those buries the real sessions behind rows of `(no messages)`.
+
+Conversion therefore **skips any session with no conversation message** unless `--include-empty` is passed, and the browser hides them until `e` reveals them. `dshpi prune-empty` cleans up a corpus imported before that rule existed: it reports the empty sessions this tool wrote and deletes them under `--execute`. Native sessions of the destination harness are never candidates, empty or not.
 
 ## Mapping
 
@@ -95,11 +103,14 @@ Every converted entry carries a `dsh` field holding the source `seq`, event type
 - **DSH → Pi → DSH** must reproduce the header and every event row byte for byte.
 - **Pi → DSH → Pi** must reproduce the header, the title, and every transcript block. Entry counts legitimately grow here, because DSH replay needs the turn and step scaffolding Pi has no entries for; that scaffolding is dropped again on the way back.
 
-Measured on 551 DSH sessions and 4 Pi sessions: all identical, ~12 s.
+Measured on 551 DSH sessions and 400 Pi sessions: all identical, ~21 s.
 
 ```
 $ dshpi verify dsh
 551 checked · 551 identical · 0 changed · 0 unreadable
+
+$ dshpi verify pi
+400 checked · 400 identical · 0 changed · 0 unreadable
 ```
 
 ### Known limits
