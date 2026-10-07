@@ -18,7 +18,7 @@ The harnesses persist sessions differently and none reads the others:
 | Location | `~/.dsh/sessions/<bucket>/<id>/session.v<N>.jsonl.zstd` | `~/.omp/agent/sessions/<bucket>/<ts>_<id>.jsonl` | `~/.claude/projects/<bucket>/<id>.jsonl` |
 | Framing | zstd-compressed JSONL, one file per released generation | plain JSONL, 256-byte fixed-width title slot first | plain JSONL, one record per content block |
 | Model | flat event log (`seq`, `time`, `type`, `data`) | append-only entry tree (`id`, `parentId`) | record tree (`uuid`, `parentUuid`) |
-| Project bucket | `--Users-me-Projects-x--` | `-Projects-x` under home, `--opt-work-x--` elsewhere | `-Users-me-Projects-x`, every non-alphanumeric character as `-` |
+| Project bucket | `--Users-me-Projects-x--` | `-Projects-x` under home, `-tmp-x` under the temp root (`$TMPDIR`, else `/tmp`), `--opt-work-x--` elsewhere, all on symlink-resolved paths | `-Users-me-Projects-x`, every non-alphanumeric character as `-` |
 
 Claude Code is a one-way source: its sessions import into Pi, and nothing converts into Claude Code.
 
