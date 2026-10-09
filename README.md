@@ -27,9 +27,10 @@ Claude Code is a one-way source: its sessions import into Pi, and nothing conver
 Needs a Rust toolchain. Builds into the shared cache at `~/.rust/target` (see `.cargo/config.toml`).
 
 ```sh
-cargo build --release
-install -m755 ~/.rust/target/release/dshpi ~/.local/bin/dshpi
+make install
 ```
+
+Builds release and installs to `~/.local/bin` (override with `INSTALL_DIR=`). `make help` lists every target; `make ci` runs fmt, clippy, tests, and the release build.
 
 Session roots are discovered from `~/.dsh`, `~/.omp`, and `~/.claude`, overridable with `DSH_HOME`, `OMP_HOME`, `CLAUDE_CONFIG_DIR`, or the direct `DSH_SESSIONS_DIR`, `OMP_SESSIONS_DIR`, `CLAUDE_SESSIONS_DIR`.
 
