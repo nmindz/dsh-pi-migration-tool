@@ -24,7 +24,7 @@ Claude Code is a one-way source: its sessions import into Pi, and nothing conver
 
 ## Install
 
-Needs a Rust toolchain. Builds into the shared cache at `~/.rust/target` (see `.cargo/config.toml`).
+Needs a Rust toolchain.
 
 ```sh
 make install
@@ -191,3 +191,7 @@ src/main.rs           CLI
 ```sh
 cargo test   # format, mapping, and round-trip unit tests
 ```
+
+## License
+
+GPL-3.0-only. See [LICENSE](LICENSE).

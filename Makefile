@@ -6,7 +6,7 @@ INSTALL_DIR ?= $(HOME)/.local/bin
 TARGET ?= $(shell rustc -vV | awk '/^host:/ { print $$2 }')
 DIST_DIR := dist
 
-# Artifacts live in the shared cache from .cargo/config.toml, not ./target. Lazy + memoized.
+# Resolved from cargo metadata so CARGO_TARGET_DIR / target-dir overrides are honored. Lazy + memoized.
 TARGET_DIR = $(or $(_TARGET_DIR),$(eval _TARGET_DIR := $(shell $(CARGO) metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'))$(_TARGET_DIR))
 
 .DEFAULT_GOAL := build
@@ -87,7 +87,7 @@ dist-clean: clean ## Remove build artifacts, dist dir, and lock file
 	rm -f Cargo.lock
 
 # rustc never deletes old incremental session dirs. Keep the newest per profile;
-# scoped to $(BINARY)-* because the cache is shared across projects.
+# scoped to $(BINARY)-* because the target dir may be shared across projects.
 .PHONY: prune-incremental
 prune-incremental: ## Prune stale incremental-compilation caches
 	@for dir in $(TARGET_DIR)/debug/incremental $(TARGET_DIR)/release/incremental; do \

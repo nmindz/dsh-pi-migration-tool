@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Session converter between DeepSeek Harness (DSH) logs and Oh My Pi (OMP/pi) transcripts, with a one-way Claude Code import into Pi and a Ratatui browser."
-license = "MIT"
+license = "GPL-3.0-only"
 publish = false
 
 [[bin]]
