@@ -1,12 +1,12 @@
-# dsh-pi-migration-tool
+# pi-transfuse
 
 Converts coding-agent sessions between **DeepSeek Harness** (DSH) and **Oh My Pi** (OMP / pi), in both directions, and imports **Claude Code** sessions into Pi, with a Ratatui browser for picking what to move.
 
 ```
-dshpi                        # browse and convert interactively
-dshpi convert-all dsh        # migrate every DSH session into ~/.omp/agent/sessions
-dshpi convert-all claude     # import every Claude Code session Pi does not already hold
-dshpi verify                 # prove the conversions lose nothing
+pi-transfuse                        # browse and convert interactively
+pi-transfuse convert-all dsh        # migrate every DSH session into ~/.omp/agent/sessions
+pi-transfuse convert-all claude     # import every Claude Code session Pi does not already hold
+pi-transfuse verify                 # prove the conversions lose nothing
 ```
 
 ## Why it exists
@@ -36,7 +36,7 @@ Session roots are discovered from `~/.dsh`, `~/.omp`, and `~/.claude`, overridab
 
 ## Browser
 
-`dshpi` with no subcommand opens the browser.
+`pi-transfuse` with no subcommand opens the browser.
 
 | Key | Action |
 |---|---|
@@ -74,14 +74,14 @@ Uncheck the projects or sessions you already moved some other way, then `x` asks
 ## Commands
 
 ```sh
-dshpi list [dsh|pi|claude] [--filter TEXT]
+pi-transfuse list [dsh|pi|claude] [--filter TEXT]
 
-dshpi convert <id-or-path> [--to dsh|pi] [--out DIR] [--dry-run] [--force] [--include-empty] [--include-duplicates]
-dshpi convert-all <dsh|pi|claude> [--filter TEXT] [--out DIR] [--dry-run] [--force] [--include-empty] [--include-duplicates]
+pi-transfuse convert <id-or-path> [--to dsh|pi] [--out DIR] [--dry-run] [--force] [--include-empty] [--include-duplicates]
+pi-transfuse convert-all <dsh|pi|claude> [--filter TEXT] [--out DIR] [--dry-run] [--force] [--include-empty] [--include-duplicates]
 
-dshpi prune-empty [--filter TEXT] [--execute]
-dshpi verify [dsh|pi|claude] [--filter TEXT] [--all]
-dshpi export <id-or-path> [--format md|text] [-o FILE]
+pi-transfuse prune-empty [--filter TEXT] [--execute]
+pi-transfuse verify [dsh|pi|claude] [--filter TEXT] [--all]
+pi-transfuse export <id-or-path> [--format md|text] [-o FILE]
 ```
 
 `<id-or-path>` accepts a session-id prefix or a path to a session file; the direction is inferred from the source. Without `--out`, conversions write into the destination harness's real session root, so the result is immediately listed and resumable there. Claude Code sessions always land in Pi, and `--include-duplicates` imports one even when Pi already holds a copy.
@@ -90,7 +90,7 @@ dshpi export <id-or-path> [--format md|text] [-o FILE]
 
 A cancelled or never-used launch leaves behind a log holding nothing but startup records — permission preset, sandbox mode, approval policy — and no prompt or reply. Importing those buries the real sessions behind rows of `(no messages)`.
 
-Conversion therefore **skips any session with no conversation message** unless `--include-empty` is passed, and the browser hides them until `e` reveals them. `dshpi prune-empty` cleans up a corpus imported before that rule existed: it reports the empty sessions this tool wrote and deletes them under `--execute`. Native sessions of the destination harness are never candidates, empty or not.
+Conversion therefore **skips any session with no conversation message** unless `--include-empty` is passed, and the browser hides them until `e` reveals them. `pi-transfuse prune-empty` cleans up a corpus imported before that rule existed: it reports the empty sessions this tool wrote and deletes them under `--execute`. Native sessions of the destination harness are never candidates, empty or not.
 
 A Claude Code session counts as empty when no model ever replied — it ran only slash commands such as `/model` or `/login`, or its prompts went unanswered — and the same rule applies to each of its subagents. Assistant records Claude Code writes itself, such as API errors, are not replies.
 
@@ -147,17 +147,17 @@ A Claude Code session can already be in Pi under another id: imported before, im
 
 Every converted entry carries a `dsh` field holding the source `seq`, event type, surface intent, and the source payload **minus exactly the fields the Pi entry already materializes** — message content, tool-result metadata, compaction summary, title. Nothing is stored twice, and converting back rebuilds the original rows instead of an approximation.
 
-`dshpi verify` proves this against your real sessions:
+`pi-transfuse verify` proves this against your real sessions:
 
 - **DSH → Pi → DSH** must reproduce the header and every event row byte for byte.
 - **Pi → DSH → Pi** must reproduce the header, the title, and every transcript block. Entry counts legitimately grow here, because DSH replay needs the turn and step scaffolding Pi has no entries for; that scaffolding is dropped again on the way back.
 - **Claude Code → Pi**, being one-way, must carry every prompt, reply, reasoning block, tool call, tool result, injected context message, and compaction of the source and of each subagent. Each kind is compared in its own order, since a response's tool results legitimately move up next to it.
 
 ```
-$ dshpi verify dsh
+$ pi-transfuse verify dsh
 553 checked · 553 identical · 0 changed · 0 unreadable
 
-$ dshpi verify claude
+$ pi-transfuse verify claude
 68 checked · 68 identical · 0 changed · 0 unreadable
 ```
 

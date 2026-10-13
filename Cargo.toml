@@ -1,5 +1,5 @@
 [package]
-name = "dsh-pi-migration-tool"
+name = "pi-transfuse"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 publish = false
 
 [[bin]]
-name = "dshpi"
+name = "pi-transfuse"
 path = "src/main.rs"
 
 [dependencies]

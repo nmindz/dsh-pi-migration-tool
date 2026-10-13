@@ -843,7 +843,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .title(Span::styled(
-                    " dshpi — DSH ⇄ Pi ← Claude Code ",
+                    " pi-transfuse — DSH ⇄ Pi ← Claude Code ",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ))
                 .title_top(Line::from(Span::styled(flags, Style::default().fg(WARN))).right_aligned()),

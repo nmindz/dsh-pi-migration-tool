@@ -1,6 +1,6 @@
-# dshpi — DSH ⇄ Pi session migration tool
+# pi-transfuse — session migration between DSH, Pi, and Claude Code
 
-BINARY := dshpi
+BINARY := pi-transfuse
 CARGO ?= cargo
 INSTALL_DIR ?= $(HOME)/.local/bin
 TARGET ?= $(shell rustc -vV | awk '/^host:/ { print $$2 }')

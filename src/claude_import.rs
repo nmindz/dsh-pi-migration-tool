@@ -1055,7 +1055,7 @@ mod tests {
 
     #[test]
     fn an_imported_session_is_recognized_on_the_next_scan() {
-        let root = std::env::temp_dir().join(format!("dshpi-claude-scan-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("pi-transfuse-claude-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let file = run(&[user("u1", None, json!("build the project now"))]);
         pi::write_file(&root.join("-w").join("s.jsonl"), &file).unwrap();

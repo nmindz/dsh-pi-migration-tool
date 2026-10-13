@@ -1,4 +1,4 @@
-//! `dshpi` — convert sessions between DeepSeek Harness and Oh My Pi, and
+//! `pi-transfuse` — convert sessions between DeepSeek Harness and Oh My Pi, and
 //! import Claude Code sessions into Oh My Pi.
 //!
 //! Running the binary with no subcommand opens the Ratatui browser; the
@@ -52,7 +52,7 @@ pub enum ExportFormat {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "dshpi",
+    name = "pi-transfuse",
     version,
     about = "Convert sessions between DeepSeek Harness (DSH) and Oh My Pi (OMP), and import Claude Code sessions into OMP",
     long_about = None
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
 
 /// Lets a listing end quietly when its reader closes the pipe.
 ///
-/// Rust ignores `SIGPIPE`, which turns `dshpi list | head` into a panic from
+/// Rust ignores `SIGPIPE`, which turns `pi-transfuse list | head` into a panic from
 /// inside `println!`. Restoring the default disposition before any output
 /// starts gives the ordinary CLI behavior.
 fn restore_default_sigpipe() {
